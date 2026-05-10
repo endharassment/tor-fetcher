@@ -256,7 +256,9 @@ func NewTorClient() *TorClient {
 			return nil, err
 		}
 		// TLS handshake with Firefox fingerprint.
-		cfg := &utls.Config{ServerName: host}
+		// Skip verification: onion services authenticate via the .onion
+		// address itself, so the server cert is cosmetic and often expired.
+		cfg := &utls.Config{ServerName: host, InsecureSkipVerify: true}
 		uConn := utls.UClient(rawConn, cfg, utls.HelloFirefox_Auto)
 		if err := uConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
