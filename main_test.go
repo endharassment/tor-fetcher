@@ -277,8 +277,18 @@ func TestFetchHEADThroughTartarus(t *testing.T) {
 	if !solvedWithGET {
 		t.Error("challenge body was never fetched with GET")
 	}
-	if len(clearedMethods) == 0 || clearedMethods[len(clearedMethods)-1] != "HEAD" {
-		t.Errorf("destination methods = %v, want final request to be HEAD", clearedMethods)
+	// Safety property: once clearance is established, the destination must be
+	// reached ONLY via HEAD. A single GET here would download the resource
+	// body — exactly what a HEAD probe exists to avoid (e.g. probing a path
+	// the caller must not fetch). So assert NO cleared request used GET, not
+	// merely that the last one was HEAD.
+	if len(clearedMethods) == 0 {
+		t.Error("destination was never reached after clearance")
+	}
+	for _, m := range clearedMethods {
+		if m != "HEAD" {
+			t.Errorf("cleared destination reached with %q; a HEAD probe must never fetch the body (methods = %v)", m, clearedMethods)
+		}
 	}
 }
 

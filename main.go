@@ -386,7 +386,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 
 		if strings.Contains(body, "data-ttrs-challenge") {
 			tracef("  -> Tartarus challenge")
-			challengeResp, err := tc.solveTartarus(requestURL, body)
+			challengeResp, err := tc.solveTartarus(method, requestURL, body)
 			if err != nil {
 				return nil, err
 			}
@@ -417,7 +417,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 	return nil, fmt.Errorf("too many redirects/challenges")
 }
 
-func (tc *TorClient) solveTartarus(requestURL *url.URL, body string) (*http.Response, error) {
+func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string) (*http.Response, error) {
 	salt := extractAttr(body, "data-ttrs-challenge")
 	diffStr := extractAttr(body, "data-ttrs-difficulty")
 	difficulty, err := strconv.Atoi(diffStr)
@@ -467,8 +467,12 @@ func (tc *TorClient) solveTartarus(requestURL *url.URL, body string) (*http.Resp
 		slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
 	}
 
-	// Re-GET the original target (cookie jar preserves ttrs_clearance).
-	return tc.Get(requestURL.String(), requestURL.String())
+	// Re-fetch the original target with the CALLER'S method now that the
+	// ttrs_clearance cookie is set (the jar preserves it). Using the caller's
+	// method rather than a hardcoded GET means a HEAD probe never downloads the
+	// destination body — essential when the caller must learn a resource's
+	// status without fetching the resource itself. For GET this is unchanged.
+	return tc.do(method, requestURL.String(), requestURL.String())
 }
 
 func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
