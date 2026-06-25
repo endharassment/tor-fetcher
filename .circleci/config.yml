@@ -1,12 +1,12 @@
 version: 2.1
 
 orbs:
-  go: circleci/go@1.8.0
+  go: circleci/go@4.0.0
 
 jobs:
   build:
     docker:
-      - image: cimg/go:1.25
+      - image: cimg/go:1.26
     resource_class: large
     steps:
       - checkout
