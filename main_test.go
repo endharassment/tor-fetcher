@@ -140,6 +140,148 @@ func TestSolveTartarusFlow(t *testing.T) {
 	}
 }
 
+// newTestClient builds a TorClient backed by the test server's TLS client,
+// with a cookie jar and manual redirect handling matching production.
+func newTestClient(ts *httptest.Server) *TorClient {
+	jar, _ := cookiejar.New(nil)
+	c := ts.Client()
+	c.Jar = jar
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &TorClient{c: *c}
+}
+
+// setMethod overrides the global --method flag for a test, returning a
+// restore function intended for defer.
+func setMethod(m string) func() {
+	old := *method
+	*method = m
+	return func() { *method = old }
+}
+
+func TestFetchMethodHEAD(t *testing.T) {
+	var gotMethod string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		w.Header().Set("X-Test", "present")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != "HEAD" {
+			fmt.Fprint(w, "body content")
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("HEAD")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotMethod != "HEAD" {
+		t.Errorf("server saw method %q, want HEAD", gotMethod)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Test") != "present" {
+		t.Errorf("missing X-Test header on HEAD response")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 0 {
+		t.Errorf("HEAD body = %q, want empty", body)
+	}
+}
+
+func TestFetchReturnsNonOKBody(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, "the page was not found")
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+	body, err := decodeBody(resp)
+	if err != nil {
+		t.Fatalf("decodeBody: %v", err)
+	}
+	if string(body) != "the page was not found" {
+		t.Errorf("body = %q, want the 404 page content", body)
+	}
+}
+
+func TestFetchHEADThroughTartarus(t *testing.T) {
+	// A HEAD request to a Tartarus-protected page must solve the challenge
+	// (which requires fetching the HTML body via GET) and then re-issue the
+	// destination request as HEAD once the clearance cookie is set.
+	const (
+		wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+		wantDiff = "16"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html data-ttrs-challenge="%s" data-ttrs-difficulty="%s"></html>`,
+		wantSalt, wantDiff)
+
+	var clearedMethods []string
+	var solvedWithGET bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "POST":
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"success":true}`)
+		case r.URL.Path == "/":
+			if _, err := r.Cookie("ttrs_clearance"); err != nil {
+				// Not yet cleared: serve the challenge. The body is only
+				// populated for GET (the HTTP server drops bodies on HEAD).
+				if r.Method == "GET" {
+					solvedWithGET = true
+				}
+				w.WriteHeader(http.StatusNonAuthoritativeInfo)
+				fmt.Fprint(w, challengeHTML)
+				return
+			}
+			// Cleared: record which method reached the destination.
+			clearedMethods = append(clearedMethods, r.Method)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>real page</html>")
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("HEAD")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if !solvedWithGET {
+		t.Error("challenge body was never fetched with GET")
+	}
+	if len(clearedMethods) == 0 || clearedMethods[len(clearedMethods)-1] != "HEAD" {
+		t.Errorf("destination methods = %v, want final request to be HEAD", clearedMethods)
+	}
+}
+
 func TestArgonCheck(t *testing.T) {
 	// Use minimal parameters so the test runs quickly.
 	p := ArgonParams{

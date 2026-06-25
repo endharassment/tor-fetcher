@@ -32,6 +32,22 @@ var target = flag.String("target", "", "The URL to retrieve (required)")
 var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0", "Tor user agent by default")
 var socksAddr = flag.String("proxy", "socks5://127.0.0.1:9050", "SOCKS5 proxy address for Tor")
 var debug = flag.Bool("debug", false, "Enable debug logging")
+var method = flag.String("method", "GET", "HTTP request method, e.g. HEAD")
+var trace = flag.Bool("trace", false, "Print the request/redirect/challenge chain to stderr")
+
+func init() {
+	// Curl-style alias for --method.
+	flag.StringVar(method, "X", "GET", "alias for --method")
+}
+
+// tracef prints a line to stderr describing a step in the fetch chain when
+// --trace is enabled. Unlike --debug it is concise and aimed at following
+// redirects and challenges.
+func tracef(format string, args ...any) {
+	if *trace {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
 
 func main() {
 	flag.Parse()
@@ -47,25 +63,40 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Non-200 status code: %d\n", resp.StatusCode)
-	}
-
 	defer resp.Body.Close()
 
-	var reader io.ReadCloser
-	switch resp.Header.Get("Content-Encoding") {
-	case "gzip":
-		reader, err = gzip.NewReader(resp.Body)
-		defer reader.Close()
-	default:
-		reader = resp.Body
+	// Surface the status line and headers on stderr for non-200 responses
+	// (and HEAD, which has no body) so failures and probes are debuggable.
+	if resp.StatusCode != http.StatusOK || strings.EqualFold(*method, "HEAD") {
+		fmt.Fprintf(os.Stderr, "HTTP %d %s\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+		resp.Header.Write(os.Stderr)
+		fmt.Fprintln(os.Stderr)
 	}
-	body, err := io.ReadAll(reader)
+
+	body, err := decodeBody(resp)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(string(body))
+	// Print the body even on errors so the actual content is visible.
+	os.Stdout.Write(body)
+
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+}
+
+// decodeBody reads a response body, transparently decompressing gzip.
+func decodeBody(resp *http.Response) ([]byte, error) {
+	reader := resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gz.Close()
+		return io.ReadAll(gz)
+	}
+	return io.ReadAll(reader)
 }
 
 type ArgonParams struct {
@@ -141,13 +172,18 @@ func setHeaders(req *http.Request, referer string) {
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
 
-func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", target, nil)
+// do issues a bodyless request with the given method (GET, HEAD, ...).
+func (tc *TorClient) do(method, target, referer string) (*http.Response, error) {
+	req, err := http.NewRequest(method, target, nil)
 	if err != nil {
 		return nil, err
 	}
 	setHeaders(req, referer)
 	return tc.c.Do(req)
+}
+
+func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
+	return tc.do("GET", target, referer)
 }
 
 func (tc *TorClient) PostForm(target, referer string, data url.Values) (*http.Response, error) {
@@ -280,14 +316,34 @@ func NewTorClient() *TorClient {
 }
 
 func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
+	method := strings.ToUpper(*method)
+	if method == "" {
+		method = "GET"
+	}
 	currentURL := target
 	currentReferer := referer
 
+	// Challenges are always solved with GET (we need the HTML body and a
+	// clearance cookie). finalize re-issues the destination request with the
+	// caller's method once clearance is established. For plain GET it is a
+	// no-op, so there is no extra round trip in the common case.
+	finalize := func(resp *http.Response) (*http.Response, error) {
+		if method == "GET" {
+			return resp, nil
+		}
+		u := resp.Request.URL.String()
+		ref := resp.Request.Header.Get("Referer")
+		resp.Body.Close()
+		tracef("%s %s (after clearance)", method, u)
+		return tc.do(method, u, ref)
+	}
+
 	for range 10 { // max redirect/challenge hops
-		resp, err := tc.Get(currentURL, currentReferer)
+		resp, err := tc.do(method, currentURL, currentReferer)
 		if err != nil {
 			return nil, err
 		}
+		tracef("%s %s -> %d %s", method, currentURL, resp.StatusCode, http.StatusText(resp.StatusCode))
 
 		// Follow redirects manually (we disabled auto-follow).
 		if loc := resp.Header.Get("Location"); loc != "" &&
@@ -297,27 +353,39 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 			if err != nil {
 				return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
 			}
+			tracef("  -> redirect to %s", resolved)
 			slog.Debug("following redirect", "from", currentURL, "to", resolved)
 			currentReferer = currentURL
 			currentURL = resolved.String()
 			continue
 		}
 
-		// Not a challenge — return directly.
+		// Not a challenge — return directly (with the caller's method).
 		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo {
 			return resp, nil
 		}
 
-		// Read the challenge body.
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		// Read the challenge body. HEAD and other bodyless methods can't see
+		// it, so refetch the challenge page with GET.
+		chResp := resp
+		if method != "GET" {
+			resp.Body.Close()
+			chResp, err = tc.do("GET", currentURL, currentReferer)
+			if err != nil {
+				return nil, err
+			}
+			tracef("GET %s -> %d %s (challenge body)", currentURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
+		}
+		bodyBytes, err := io.ReadAll(chResp.Body)
+		chResp.Body.Close()
 		if err != nil {
 			return nil, err
 		}
 		body := string(bodyBytes)
-		requestURL := resp.Request.URL
+		requestURL := chResp.Request.URL
 
 		if strings.Contains(body, "data-ttrs-challenge") {
+			tracef("  -> Tartarus challenge")
 			challengeResp, err := tc.solveTartarus(requestURL, body)
 			if err != nil {
 				return nil, err
@@ -331,14 +399,20 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 				if err != nil {
 					return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
 				}
+				tracef("  -> redirect after challenge to %s", resolved)
 				slog.Debug("following redirect after challenge", "from", requestURL, "to", resolved)
 				currentReferer = requestURL.String()
 				currentURL = resolved.String()
 				continue
 			}
-			return challengeResp, nil
+			return finalize(challengeResp)
 		}
-		return tc.solveBasedFlare(requestURL, body)
+		tracef("  -> BasedFlare challenge")
+		bfResp, err := tc.solveBasedFlare(requestURL, body)
+		if err != nil {
+			return nil, err
+		}
+		return finalize(bfResp)
 	}
 	return nil, fmt.Errorf("too many redirects/challenges")
 }

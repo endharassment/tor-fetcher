@@ -44,7 +44,9 @@ All code lives in a single `main.go` (~460 lines) with tests in `main_test.go`. 
 
 ### CLI Flags
 
-`--target` (required URL), `--proxy` (default `socks5://127.0.0.1:9050`), `--ua` (User-Agent), `--debug` (slog debug to stderr), `-p` (Argon2 parallelism), `-l` (Argon2 key length).
+`--target` (required URL), `--proxy` (default `socks5://127.0.0.1:9050`), `--ua` (User-Agent), `--method`/`-X` (HTTP method, default `GET`, e.g. `HEAD`), `--trace` (print the request/redirect/challenge chain to stderr), `--debug` (slog debug to stderr), `-p` (Argon2 parallelism), `-l` (Argon2 key length).
+
+On non-200 responses (and HEAD), the status line and headers are written to stderr and the body is still printed to stdout; the process exits non-zero on non-200. Challenges are always solved with GET (the solver needs the HTML body and clearance cookie); the chosen method is applied to the destination request once clearance is established.
 
 ## Testing Notes
 
