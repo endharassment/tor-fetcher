@@ -292,6 +292,37 @@ func TestFetchHEADThroughTartarus(t *testing.T) {
 	}
 }
 
+func TestFetchHEADRefusesForbidden(t *testing.T) {
+	// A HEAD that draws a 403 must NOT fall back to a GET of the target: that
+	// GET can return the resource body (a 403 is intermittent / indistinguish-
+	// able from a real Forbidden, and the "challenge" body may actually be the
+	// file). So Fetch must error out without ever GETing the target.
+	var sawGET bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && r.Method == "GET" {
+			// If the guard were missing, the fallback GET would land here and
+			// the body would be downloaded. The resource leaks on GET.
+			sawGET = true
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "RESOURCE BODY THAT MUST NOT BE FETCHED")
+			return
+		}
+		// HEAD (and anything else) → 403.
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer ts.Close()
+	defer setMethod("HEAD")()
+
+	tc := newTestClient(ts)
+	_, err := tc.Fetch(ts.URL+"/", "")
+	if err == nil {
+		t.Fatal("expected an error refusing the 403 challenge in HEAD mode, got nil")
+	}
+	if sawGET {
+		t.Error("a GET reached the target after a 403 HEAD — must never fall back to a body-fetching GET")
+	}
+}
+
 func TestArgonCheck(t *testing.T) {
 	// Use minimal parameters so the test runs quickly.
 	p := ArgonParams{

@@ -365,6 +365,20 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 			return resp, nil
 		}
 
+		// Body-safety for HEAD probes. Only a 203 Tartarus interstitial is safe
+		// to resolve in HEAD mode: Tartarus consistently gates every unsolved
+		// request, so the challenge-reading GET below returns the challenge
+		// page, never the resource. A 403 is different — it is intermittent and
+		// indistinguishable from a genuine Forbidden, and resolving it means
+		// GETing the target to read a "challenge" body that may actually BE the
+		// resource (downloading it). A HEAD probe exists precisely to avoid
+		// fetching the body, so refuse a 403 outright rather than fall back to a
+		// GET of the target. The caller can retry for a clean Tartarus-only pass.
+		if method == "HEAD" && resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			return nil, fmt.Errorf("refusing to resolve a 403 challenge for a HEAD request: it would require a GET of the target that could download the body; retry for a Tartarus-only pass")
+		}
+
 		// Read the challenge body. HEAD and other bodyless methods can't see
 		// it, so refetch the challenge page with GET.
 		chResp := resp
