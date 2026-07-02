@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -35,12 +36,18 @@ var debug = flag.Bool("debug", false, "Enable debug logging")
 var method = flag.String("method", "GET", "HTTP request method, e.g. HEAD")
 var trace = flag.Bool("trace", false, "Print the request/redirect/challenge chain to stderr")
 var postData = flag.String("data", "", "application/x-www-form-urlencoded POST body, e.g. \"foo=bar&baz=qux\"")
+var cookieIn = flag.String("cookie", "", "Read cookies for --target's host from this JSON file before fetching (see --cookie-jar)")
+var cookieOut = flag.String("cookie-jar", "", "Write cookies for --target's host to this JSON file after fetching")
 
 func init() {
 	// Curl-style alias for --method.
 	flag.StringVar(method, "X", "GET", "alias for --method")
 	// Curl-style alias for --data.
 	flag.StringVar(postData, "d", "", "alias for --data")
+	// Curl-style alias for --cookie.
+	flag.StringVar(cookieIn, "b", "", "alias for --cookie")
+	// Curl-style alias for --cookie-jar.
+	flag.StringVar(cookieOut, "c", "", "alias for --cookie-jar")
 }
 
 // tracef prints a line to stderr describing a step in the fetch chain when
@@ -61,12 +68,27 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	targetURL, err := url.Parse(*target)
+	if err != nil {
+		log.Fatalf("parsing --target: %v", err)
+	}
+
 	tc := NewTorClient()
+	if *cookieIn != "" {
+		if err := loadCookies(*cookieIn, tc.c.Jar, targetURL); err != nil {
+			log.Fatalf("loading --cookie: %v", err)
+		}
+	}
 	resp, err := tc.Fetch(*target, "", []byte(*postData))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if *cookieOut != "" {
+		if err := saveCookies(*cookieOut, tc.c.Jar, resp.Request.URL); err != nil {
+			log.Fatalf("saving --cookie-jar: %v", err)
+		}
+	}
 
 	// Surface the status line and headers on stderr for non-200 responses
 	// (and HEAD, which has no body) so failures and probes are debuggable.
@@ -86,6 +108,47 @@ func main() {
 	if resp.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}
+}
+
+// jsonCookie is the on-disk shape used by --cookie/--cookie-jar. It carries
+// just enough of http.Cookie to round-trip a session between separate
+// tor-fetcher invocations (e.g. fetch a page to establish a session and CSRF
+// token, then POST a form using that same session).
+type jsonCookie struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// loadCookies reads cookies from path and installs them into jar for u's
+// origin, so a subsequent Fetch(u, ...) reuses the session.
+func loadCookies(path string, jar http.CookieJar, u *url.URL) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cookies []jsonCookie
+	if err := json.Unmarshal(data, &cookies); err != nil {
+		return err
+	}
+	httpCookies := make([]*http.Cookie, 0, len(cookies))
+	for _, c := range cookies {
+		httpCookies = append(httpCookies, &http.Cookie{Name: c.Name, Value: c.Value})
+	}
+	jar.SetCookies(u, httpCookies)
+	return nil
+}
+
+// saveCookies writes jar's cookies for u's origin to path as JSON.
+func saveCookies(path string, jar http.CookieJar, u *url.URL) error {
+	var cookies []jsonCookie
+	for _, c := range jar.Cookies(u) {
+		cookies = append(cookies, jsonCookie{Name: c.Name, Value: c.Value})
+	}
+	data, err := json.MarshalIndent(cookies, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 // decodeBody reads a response body, transparently decompressing gzip.
