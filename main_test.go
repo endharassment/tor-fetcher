@@ -106,7 +106,7 @@ func TestSolveTartarusFlow(t *testing.T) {
 	testClient := ts.Client()
 	testClient.Jar = jar
 	tc := &TorClient{c: *testClient}
-	resp, err := tc.Fetch(ts.URL+"/", "")
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestFetchMethodHEAD(t *testing.T) {
 	defer setMethod("HEAD")()
 
 	tc := newTestClient(ts)
-	resp, err := tc.Fetch(ts.URL+"/", "")
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestFetchReturnsNonOKBody(t *testing.T) {
 	defer setMethod("GET")()
 
 	tc := newTestClient(ts)
-	resp, err := tc.Fetch(ts.URL+"/", "")
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestFetchHEADThroughTartarus(t *testing.T) {
 	defer setMethod("HEAD")()
 
 	tc := newTestClient(ts)
-	resp, err := tc.Fetch(ts.URL+"/", "")
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -292,6 +292,71 @@ func TestFetchHEADThroughTartarus(t *testing.T) {
 	}
 }
 
+func TestFetchPOSTThroughTartarus(t *testing.T) {
+	// A POST body (e.g. a search form submission) must survive a Tartarus
+	// challenge round trip: the challenge itself is solved with a bodyless
+	// GET, but the destination request re-issued after clearance must carry
+	// the original POST body and its form Content-Type.
+	const (
+		wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+		wantDiff = "16"
+		wantBody = "keywords=example&c%5Busers%5D=someuser"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html data-ttrs-challenge="%s" data-ttrs-difficulty="%s"></html>`,
+		wantSalt, wantDiff)
+
+	var gotBody, gotContentType string
+	var gotMethod string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "POST":
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"success":true}`)
+		case r.URL.Path == "/search/search":
+			if _, err := r.Cookie("ttrs_clearance"); err != nil {
+				// Not yet cleared: serve the challenge (bodyless probe is fine
+				// here, only GET can read this body per the existing flow).
+				w.WriteHeader(http.StatusNonAuthoritativeInfo)
+				fmt.Fprint(w, challengeHTML)
+				return
+			}
+			// Cleared: record what reached the destination.
+			gotMethod = r.Method
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			gotContentType = r.Header.Get("Content-Type")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>results</html>")
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("POST")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/search/search", "", []byte(wantBody))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("destination reached with method %q, want POST", gotMethod)
+	}
+	if gotBody != wantBody {
+		t.Errorf("destination body = %q, want %q", gotBody, wantBody)
+	}
+	if gotContentType != "application/x-www-form-urlencoded" {
+		t.Errorf("destination Content-Type = %q, want application/x-www-form-urlencoded", gotContentType)
+	}
+}
+
 func TestFetchHEADRefusesForbidden(t *testing.T) {
 	// A HEAD that draws a 403 must NOT fall back to a GET of the target: that
 	// GET can return the resource body (a 403 is intermittent / indistinguish-
@@ -314,7 +379,7 @@ func TestFetchHEADRefusesForbidden(t *testing.T) {
 	defer setMethod("HEAD")()
 
 	tc := newTestClient(ts)
-	_, err := tc.Fetch(ts.URL+"/", "")
+	_, err := tc.Fetch(ts.URL+"/", "", nil)
 	if err == nil {
 		t.Fatal("expected an error refusing the 403 challenge in HEAD mode, got nil")
 	}

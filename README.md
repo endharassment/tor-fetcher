@@ -20,3 +20,6 @@ tor-fetcher --target <url> [flags]
 | `--debug` | `false` | Enable debug logging to stderr |
 | `-p` | `1` | Argon2 parallelism |
 | `-l` | `32` | Argon2 key length |
+| `--method` / `-X` | `GET` | HTTP request method, e.g. `POST` |
+| `--data` / `-d` | (none) | `application/x-www-form-urlencoded` POST body, e.g. `"foo=bar&baz=qux"` |
+| `--trace` | `false` | Print the request/redirect/challenge chain to stderr |

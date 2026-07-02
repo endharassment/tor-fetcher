@@ -34,10 +34,13 @@ var socksAddr = flag.String("proxy", "socks5://127.0.0.1:9050", "SOCKS5 proxy ad
 var debug = flag.Bool("debug", false, "Enable debug logging")
 var method = flag.String("method", "GET", "HTTP request method, e.g. HEAD")
 var trace = flag.Bool("trace", false, "Print the request/redirect/challenge chain to stderr")
+var postData = flag.String("data", "", "application/x-www-form-urlencoded POST body, e.g. \"foo=bar&baz=qux\"")
 
 func init() {
 	// Curl-style alias for --method.
 	flag.StringVar(method, "X", "GET", "alias for --method")
+	// Curl-style alias for --data.
+	flag.StringVar(postData, "d", "", "alias for --data")
 }
 
 // tracef prints a line to stderr describing a step in the fetch chain when
@@ -59,7 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 	tc := NewTorClient()
-	resp, err := tc.Fetch(*target, "")
+	resp, err := tc.Fetch(*target, "", []byte(*postData))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -172,18 +175,27 @@ func setHeaders(req *http.Request, referer string) {
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
 
-// do issues a bodyless request with the given method (GET, HEAD, ...).
-func (tc *TorClient) do(method, target, referer string) (*http.Response, error) {
-	req, err := http.NewRequest(method, target, nil)
+// do issues a request with the given method (GET, HEAD, POST, ...). reqBody
+// is nil for bodyless requests; when non-empty it is sent as an
+// application/x-www-form-urlencoded body (e.g. for -X POST -d "...").
+func (tc *TorClient) do(method, target, referer string, reqBody []byte) (*http.Response, error) {
+	var bodyReader io.Reader
+	if len(reqBody) > 0 {
+		bodyReader = strings.NewReader(string(reqBody))
+	}
+	req, err := http.NewRequest(method, target, bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	setHeaders(req, referer)
+	if len(reqBody) > 0 {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 	return tc.c.Do(req)
 }
 
 func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
-	return tc.do("GET", target, referer)
+	return tc.do("GET", target, referer, nil)
 }
 
 func (tc *TorClient) PostForm(target, referer string, data url.Values) (*http.Response, error) {
@@ -315,7 +327,7 @@ func NewTorClient() *TorClient {
 	return &TorClient{c: httpClient}
 }
 
-func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
+func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Response, error) {
 	method := strings.ToUpper(*method)
 	if method == "" {
 		method = "GET"
@@ -325,8 +337,8 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 
 	// Challenges are always solved with GET (we need the HTML body and a
 	// clearance cookie). finalize re-issues the destination request with the
-	// caller's method once clearance is established. For plain GET it is a
-	// no-op, so there is no extra round trip in the common case.
+	// caller's method (and body) once clearance is established. For plain
+	// GET it is a no-op, so there is no extra round trip in the common case.
 	finalize := func(resp *http.Response) (*http.Response, error) {
 		if method == "GET" {
 			return resp, nil
@@ -335,11 +347,11 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		ref := resp.Request.Header.Get("Referer")
 		resp.Body.Close()
 		tracef("%s %s (after clearance)", method, u)
-		return tc.do(method, u, ref)
+		return tc.do(method, u, ref, reqBody)
 	}
 
 	for range 10 { // max redirect/challenge hops
-		resp, err := tc.do(method, currentURL, currentReferer)
+		resp, err := tc.do(method, currentURL, currentReferer, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -384,7 +396,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		chResp := resp
 		if method != "GET" {
 			resp.Body.Close()
-			chResp, err = tc.do("GET", currentURL, currentReferer)
+			chResp, err = tc.do("GET", currentURL, currentReferer, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -400,7 +412,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 
 		if strings.Contains(body, "data-ttrs-challenge") {
 			tracef("  -> Tartarus challenge")
-			challengeResp, err := tc.solveTartarus(method, requestURL, body)
+			challengeResp, err := tc.solveTartarus(method, requestURL, body, reqBody)
 			if err != nil {
 				return nil, err
 			}
@@ -431,7 +443,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 	return nil, fmt.Errorf("too many redirects/challenges")
 }
 
-func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string) (*http.Response, error) {
+func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string, reqBody []byte) (*http.Response, error) {
 	salt := extractAttr(body, "data-ttrs-challenge")
 	diffStr := extractAttr(body, "data-ttrs-difficulty")
 	difficulty, err := strconv.Atoi(diffStr)
@@ -481,12 +493,13 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body stri
 		slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
 	}
 
-	// Re-fetch the original target with the CALLER'S method now that the
-	// ttrs_clearance cookie is set (the jar preserves it). Using the caller's
-	// method rather than a hardcoded GET means a HEAD probe never downloads the
-	// destination body — essential when the caller must learn a resource's
-	// status without fetching the resource itself. For GET this is unchanged.
-	return tc.do(method, requestURL.String(), requestURL.String())
+	// Re-fetch the original target with the CALLER'S method and body now that
+	// the ttrs_clearance cookie is set (the jar preserves it). Using the
+	// caller's method rather than a hardcoded GET means a HEAD probe never
+	// downloads the destination body — essential when the caller must learn a
+	// resource's status without fetching the resource itself. For GET this is
+	// unchanged.
+	return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
 }
 
 func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
