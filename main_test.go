@@ -357,6 +357,81 @@ func TestFetchPOSTThroughTartarus(t *testing.T) {
 	}
 }
 
+func TestFetchPOSTThroughAPIStyleTartarusChallenge(t *testing.T) {
+	// Some endpoints (observed live against a XenForo /search/search POST)
+	// answer an unsolved request with 401 + a Www-Authenticate header
+	// pointing at a separate challenge_url, instead of serving the classic
+	// 203/HTML interstitial on the target itself. The salt/difficulty must
+	// be read from that separate URL, and the retry after clearance must
+	// still hit the ORIGINAL target (with its original method/body), not
+	// the challenge endpoint.
+	const (
+		wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+		wantDiff = "16"
+		wantBody = "keywords=example&c%5Busers%5D=someuser"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html data-ttrs-challenge="%s" data-ttrs-difficulty="%s"></html>`,
+		wantSalt, wantDiff)
+
+	var gotChallengeURLMethod string
+	var gotBody, gotContentType string
+	var gotDestMethod string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "GET":
+			gotChallengeURLMethod = r.Method
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprint(w, challengeHTML)
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "POST":
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"success":true}`)
+		case r.URL.Path == "/search/search":
+			if _, err := r.Cookie("ttrs_clearance"); err != nil {
+				w.Header().Set("Www-Authenticate", `Tartarus realm="challenge", challenge_url="/.ttrs/challenge"`)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, `{"error":"challenge_required","challenge_url":"/.ttrs/challenge"}`)
+				return
+			}
+			gotDestMethod = r.Method
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			gotContentType = r.Header.Get("Content-Type")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>results</html>")
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("POST")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/search/search", "", []byte(wantBody))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if gotChallengeURLMethod != "GET" {
+		t.Error("challenge_url was never GET'd to read the salt/difficulty")
+	}
+	if gotDestMethod != "POST" {
+		t.Errorf("destination reached with method %q, want POST", gotDestMethod)
+	}
+	if gotBody != wantBody {
+		t.Errorf("destination body = %q, want %q", gotBody, wantBody)
+	}
+	if gotContentType != "application/x-www-form-urlencoded" {
+		t.Errorf("destination Content-Type = %q, want application/x-www-form-urlencoded", gotContentType)
+	}
+}
+
 func TestFetchHEADRefusesForbidden(t *testing.T) {
 	// A HEAD that draws a 403 must NOT fall back to a GET of the target: that
 	// GET can return the resource body (a 403 is intermittent / indistinguish-

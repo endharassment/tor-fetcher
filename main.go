@@ -160,6 +160,31 @@ func extractAttr(s, attr string) string {
 	return s[start : start+end]
 }
 
+// tartarusChallengeURL reports the URL to GET for a Tartarus challenge's
+// salt/difficulty when resp signals an API-style challenge via a 401 with a
+// `Www-Authenticate: Tartarus ... challenge_url="..."` header — the shape
+// used by XHR/form endpoints (e.g. a search POST), as opposed to the classic
+// 203/403 page interstitial where the target itself IS the challenge page.
+// Returns nil when resp isn't this kind of challenge.
+func tartarusChallengeURL(resp *http.Response) *url.URL {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return nil
+	}
+	auth := resp.Header.Get("Www-Authenticate")
+	if !strings.HasPrefix(auth, "Tartarus ") {
+		return nil
+	}
+	loc := extractAttr(auth, "challenge_url")
+	if loc == "" {
+		return nil
+	}
+	resolved, err := resp.Request.URL.Parse(loc)
+	if err != nil {
+		return nil
+	}
+	return resolved
+}
+
 type TorClient struct {
 	c http.Client
 }
@@ -373,7 +398,8 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 		}
 
 		// Not a challenge — return directly (with the caller's method).
-		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo {
+		challengeURL := tartarusChallengeURL(resp)
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo && challengeURL == nil {
 			return resp, nil
 		}
 
@@ -386,21 +412,34 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 		// resource (downloading it). A HEAD probe exists precisely to avoid
 		// fetching the body, so refuse a 403 outright rather than fall back to a
 		// GET of the target. The caller can retry for a clean Tartarus-only pass.
+		// (The 401 API-style challenge below is always safe: its GET target is
+		// the dedicated /.ttrs/challenge endpoint, never the destination
+		// resource, so there's nothing to leak.)
 		if method == "HEAD" && resp.StatusCode == http.StatusForbidden {
 			resp.Body.Close()
 			return nil, fmt.Errorf("refusing to resolve a 403 challenge for a HEAD request: it would require a GET of the target that could download the body; retry for a Tartarus-only pass")
 		}
 
-		// Read the challenge body. HEAD and other bodyless methods can't see
-		// it, so refetch the challenge page with GET.
+		// The original target URL to retry once clearance is established.
+		// Captured before chResp may point at a different challenge endpoint.
+		requestURL := resp.Request.URL
+
+		// Read the challenge body. Bodyless methods can't see it, and an
+		// API-style 401 challenge carries the salt/difficulty on a separate
+		// endpoint, not the response we already have — refetch with GET
+		// whenever the challenge body isn't already what we're holding.
+		fetchURL := currentURL
+		if challengeURL != nil {
+			fetchURL = challengeURL.String()
+		}
 		chResp := resp
-		if method != "GET" {
+		if method != "GET" || fetchURL != currentURL {
 			resp.Body.Close()
-			chResp, err = tc.do("GET", currentURL, currentReferer, nil)
+			chResp, err = tc.do("GET", fetchURL, currentReferer, nil)
 			if err != nil {
 				return nil, err
 			}
-			tracef("GET %s -> %d %s (challenge body)", currentURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
+			tracef("GET %s -> %d %s (challenge body)", fetchURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
 		}
 		bodyBytes, err := io.ReadAll(chResp.Body)
 		chResp.Body.Close()
@@ -408,7 +447,6 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 			return nil, err
 		}
 		body := string(bodyBytes)
-		requestURL := chResp.Request.URL
 
 		if strings.Contains(body, "data-ttrs-challenge") {
 			tracef("  -> Tartarus challenge")
