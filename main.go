@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -34,10 +35,19 @@ var socksAddr = flag.String("proxy", "socks5://127.0.0.1:9050", "SOCKS5 proxy ad
 var debug = flag.Bool("debug", false, "Enable debug logging")
 var method = flag.String("method", "GET", "HTTP request method, e.g. HEAD")
 var trace = flag.Bool("trace", false, "Print the request/redirect/challenge chain to stderr")
+var postData = flag.String("data", "", "application/x-www-form-urlencoded POST body, e.g. \"foo=bar&baz=qux\"")
+var cookieIn = flag.String("cookie", "", "Read cookies for --target's host from this JSON file before fetching (see --cookie-jar)")
+var cookieOut = flag.String("cookie-jar", "", "Write cookies for --target's host to this JSON file after fetching")
 
 func init() {
 	// Curl-style alias for --method.
 	flag.StringVar(method, "X", "GET", "alias for --method")
+	// Curl-style alias for --data.
+	flag.StringVar(postData, "d", "", "alias for --data")
+	// Curl-style alias for --cookie.
+	flag.StringVar(cookieIn, "b", "", "alias for --cookie")
+	// Curl-style alias for --cookie-jar.
+	flag.StringVar(cookieOut, "c", "", "alias for --cookie-jar")
 }
 
 // tracef prints a line to stderr describing a step in the fetch chain when
@@ -58,12 +68,27 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	targetURL, err := url.Parse(*target)
+	if err != nil {
+		log.Fatalf("parsing --target: %v", err)
+	}
+
 	tc := NewTorClient()
-	resp, err := tc.Fetch(*target, "")
+	if *cookieIn != "" {
+		if err := loadCookies(*cookieIn, tc.c.Jar, targetURL); err != nil {
+			log.Fatalf("loading --cookie: %v", err)
+		}
+	}
+	resp, err := tc.Fetch(*target, "", []byte(*postData))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if *cookieOut != "" {
+		if err := saveCookies(*cookieOut, tc.c.Jar, resp.Request.URL); err != nil {
+			log.Fatalf("saving --cookie-jar: %v", err)
+		}
+	}
 
 	// Surface the status line and headers on stderr for non-200 responses
 	// (and HEAD, which has no body) so failures and probes are debuggable.
@@ -83,6 +108,47 @@ func main() {
 	if resp.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}
+}
+
+// jsonCookie is the on-disk shape used by --cookie/--cookie-jar. It carries
+// just enough of http.Cookie to round-trip a session between separate
+// tor-fetcher invocations (e.g. fetch a page to establish a session and CSRF
+// token, then POST a form using that same session).
+type jsonCookie struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// loadCookies reads cookies from path and installs them into jar for u's
+// origin, so a subsequent Fetch(u, ...) reuses the session.
+func loadCookies(path string, jar http.CookieJar, u *url.URL) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cookies []jsonCookie
+	if err := json.Unmarshal(data, &cookies); err != nil {
+		return err
+	}
+	httpCookies := make([]*http.Cookie, 0, len(cookies))
+	for _, c := range cookies {
+		httpCookies = append(httpCookies, &http.Cookie{Name: c.Name, Value: c.Value})
+	}
+	jar.SetCookies(u, httpCookies)
+	return nil
+}
+
+// saveCookies writes jar's cookies for u's origin to path as JSON.
+func saveCookies(path string, jar http.CookieJar, u *url.URL) error {
+	var cookies []jsonCookie
+	for _, c := range jar.Cookies(u) {
+		cookies = append(cookies, jsonCookie{Name: c.Name, Value: c.Value})
+	}
+	data, err := json.MarshalIndent(cookies, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 // decodeBody reads a response body, transparently decompressing gzip.
@@ -157,6 +223,31 @@ func extractAttr(s, attr string) string {
 	return s[start : start+end]
 }
 
+// tartarusChallengeURL reports the URL to GET for a Tartarus challenge's
+// salt/difficulty when resp signals an API-style challenge via a 401 with a
+// `Www-Authenticate: Tartarus ... challenge_url="..."` header — the shape
+// used by XHR/form endpoints (e.g. a search POST), as opposed to the classic
+// 203/403 page interstitial where the target itself IS the challenge page.
+// Returns nil when resp isn't this kind of challenge.
+func tartarusChallengeURL(resp *http.Response) *url.URL {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return nil
+	}
+	auth := resp.Header.Get("Www-Authenticate")
+	if !strings.HasPrefix(auth, "Tartarus ") {
+		return nil
+	}
+	loc := extractAttr(auth, "challenge_url")
+	if loc == "" {
+		return nil
+	}
+	resolved, err := resp.Request.URL.Parse(loc)
+	if err != nil {
+		return nil
+	}
+	return resolved
+}
+
 type TorClient struct {
 	c http.Client
 }
@@ -172,18 +263,27 @@ func setHeaders(req *http.Request, referer string) {
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
 
-// do issues a bodyless request with the given method (GET, HEAD, ...).
-func (tc *TorClient) do(method, target, referer string) (*http.Response, error) {
-	req, err := http.NewRequest(method, target, nil)
+// do issues a request with the given method (GET, HEAD, POST, ...). reqBody
+// is nil for bodyless requests; when non-empty it is sent as an
+// application/x-www-form-urlencoded body (e.g. for -X POST -d "...").
+func (tc *TorClient) do(method, target, referer string, reqBody []byte) (*http.Response, error) {
+	var bodyReader io.Reader
+	if len(reqBody) > 0 {
+		bodyReader = strings.NewReader(string(reqBody))
+	}
+	req, err := http.NewRequest(method, target, bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	setHeaders(req, referer)
+	if len(reqBody) > 0 {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 	return tc.c.Do(req)
 }
 
 func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
-	return tc.do("GET", target, referer)
+	return tc.do("GET", target, referer, nil)
 }
 
 func (tc *TorClient) PostForm(target, referer string, data url.Values) (*http.Response, error) {
@@ -315,7 +415,7 @@ func NewTorClient() *TorClient {
 	return &TorClient{c: httpClient}
 }
 
-func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
+func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Response, error) {
 	method := strings.ToUpper(*method)
 	if method == "" {
 		method = "GET"
@@ -325,8 +425,8 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 
 	// Challenges are always solved with GET (we need the HTML body and a
 	// clearance cookie). finalize re-issues the destination request with the
-	// caller's method once clearance is established. For plain GET it is a
-	// no-op, so there is no extra round trip in the common case.
+	// caller's method (and body) once clearance is established. For plain
+	// GET it is a no-op, so there is no extra round trip in the common case.
 	finalize := func(resp *http.Response) (*http.Response, error) {
 		if method == "GET" {
 			return resp, nil
@@ -335,11 +435,11 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		ref := resp.Request.Header.Get("Referer")
 		resp.Body.Close()
 		tracef("%s %s (after clearance)", method, u)
-		return tc.do(method, u, ref)
+		return tc.do(method, u, ref, reqBody)
 	}
 
 	for range 10 { // max redirect/challenge hops
-		resp, err := tc.do(method, currentURL, currentReferer)
+		resp, err := tc.do(method, currentURL, currentReferer, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -361,7 +461,8 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		}
 
 		// Not a challenge — return directly (with the caller's method).
-		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo {
+		challengeURL := tartarusChallengeURL(resp)
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo && challengeURL == nil {
 			return resp, nil
 		}
 
@@ -374,21 +475,34 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		// resource (downloading it). A HEAD probe exists precisely to avoid
 		// fetching the body, so refuse a 403 outright rather than fall back to a
 		// GET of the target. The caller can retry for a clean Tartarus-only pass.
+		// (The 401 API-style challenge below is always safe: its GET target is
+		// the dedicated /.ttrs/challenge endpoint, never the destination
+		// resource, so there's nothing to leak.)
 		if method == "HEAD" && resp.StatusCode == http.StatusForbidden {
 			resp.Body.Close()
 			return nil, fmt.Errorf("refusing to resolve a 403 challenge for a HEAD request: it would require a GET of the target that could download the body; retry for a Tartarus-only pass")
 		}
 
-		// Read the challenge body. HEAD and other bodyless methods can't see
-		// it, so refetch the challenge page with GET.
+		// The original target URL to retry once clearance is established.
+		// Captured before chResp may point at a different challenge endpoint.
+		requestURL := resp.Request.URL
+
+		// Read the challenge body. Bodyless methods can't see it, and an
+		// API-style 401 challenge carries the salt/difficulty on a separate
+		// endpoint, not the response we already have — refetch with GET
+		// whenever the challenge body isn't already what we're holding.
+		fetchURL := currentURL
+		if challengeURL != nil {
+			fetchURL = challengeURL.String()
+		}
 		chResp := resp
-		if method != "GET" {
+		if method != "GET" || fetchURL != currentURL {
 			resp.Body.Close()
-			chResp, err = tc.do("GET", currentURL, currentReferer)
+			chResp, err = tc.do("GET", fetchURL, currentReferer, nil)
 			if err != nil {
 				return nil, err
 			}
-			tracef("GET %s -> %d %s (challenge body)", currentURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
+			tracef("GET %s -> %d %s (challenge body)", fetchURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
 		}
 		bodyBytes, err := io.ReadAll(chResp.Body)
 		chResp.Body.Close()
@@ -396,11 +510,10 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 			return nil, err
 		}
 		body := string(bodyBytes)
-		requestURL := chResp.Request.URL
 
 		if strings.Contains(body, "data-ttrs-challenge") {
 			tracef("  -> Tartarus challenge")
-			challengeResp, err := tc.solveTartarus(method, requestURL, body)
+			challengeResp, err := tc.solveTartarus(method, requestURL, body, reqBody)
 			if err != nil {
 				return nil, err
 			}
@@ -431,7 +544,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 	return nil, fmt.Errorf("too many redirects/challenges")
 }
 
-func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string) (*http.Response, error) {
+func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string, reqBody []byte) (*http.Response, error) {
 	salt := extractAttr(body, "data-ttrs-challenge")
 	diffStr := extractAttr(body, "data-ttrs-difficulty")
 	difficulty, err := strconv.Atoi(diffStr)
@@ -481,12 +594,13 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body stri
 		slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
 	}
 
-	// Re-fetch the original target with the CALLER'S method now that the
-	// ttrs_clearance cookie is set (the jar preserves it). Using the caller's
-	// method rather than a hardcoded GET means a HEAD probe never downloads the
-	// destination body — essential when the caller must learn a resource's
-	// status without fetching the resource itself. For GET this is unchanged.
-	return tc.do(method, requestURL.String(), requestURL.String())
+	// Re-fetch the original target with the CALLER'S method and body now that
+	// the ttrs_clearance cookie is set (the jar preserves it). Using the
+	// caller's method rather than a hardcoded GET means a HEAD probe never
+	// downloads the destination body — essential when the caller must learn a
+	// resource's status without fetching the resource itself. For GET this is
+	// unchanged.
+	return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
 }
 
 func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
