@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/net/http2"
@@ -178,6 +179,13 @@ func decodeBody(resp *http.Response) ([]byte, error) {
 		return io.ReadAll(gz)
 	case "br":
 		return io.ReadAll(brotli.NewReader(resp.Body))
+	case "zstd":
+		zr, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %w", err)
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
 	case "deflate":
 		// "deflate" is zlib-wrapped in most servers but raw flate in some, and
 		// the two are only distinguishable by trying.
@@ -371,7 +379,11 @@ func setHeaders(req *http.Request, referer string) {
 	}
 	req.Header.Set("User-Agent", *ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	// Tor Browser inherits Firefox's default for secure origins, and treats
+	// .onion as a secure context (dom.securecontext.allowlist_onions). Firefox
+	// added zstd here in 126, so "gzip, deflate, br" is a pre-126 value that
+	// would not match the Firefox version our User-Agent claims.
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
