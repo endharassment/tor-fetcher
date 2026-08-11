@@ -11,7 +11,7 @@ go test -v -run TestTartarusCheck  # Run a single test
 gofmt -w main.go      # Format before committing
 ```
 
-CI runs on CircleCI with `cimg/go:1.25` (large resource class): `go install ./...` then `go test ./...`.
+CI runs on CircleCI with `cimg/go:1.26` (large resource class): `go install ./...` then `go test ./...`.
 
 ## What This Tool Does
 
@@ -19,7 +19,7 @@ tor-fetcher is a curl-like CLI for fetching .onion URLs protected by proof-of-wo
 
 ## Architecture
 
-All code lives in a single `main.go` (~460 lines) with tests in `main_test.go`. This is intentional — keep it in one file.
+All code lives in a single `main.go` (~810 lines) with tests in `main_test.go`. This is intentional — keep it in one file.
 
 **Module path:** `github.com/endharassment/tor-fetcher`.
 
