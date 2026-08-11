@@ -7,6 +7,7 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	utls "github.com/refraction-networking/utls"
 )
 
 func TestTartarusCheck(t *testing.T) {
@@ -110,6 +112,213 @@ func TestParseTartarusChallenge(t *testing.T) {
 					p.salt, p.difficulty, tt.wantSalt, tt.wantDifficulty)
 			}
 		})
+	}
+}
+
+// TestTorBrowserHeaders pins our request headers to what Tor Browser actually
+// sends. The expectations below are transcribed from captures of Firefox
+// 140.13.0esr -- the build Tor Browser 15.0.19 ships -- run headless against a
+// local listener with Tor Browser's own prefs applied (resistFingerprinting,
+// globalprivacycontrol, private browsing, referer policies), reading the raw
+// request bytes off the socket.
+//
+// The point is not just to avoid being blocked: it's to be served the same
+// bytes as any other anonymous Tor user. So this asserts the header set
+// EXACTLY, in both directions -- a header we send that Tor Browser doesn't is
+// as much of a tell as one we're missing. DNT is the worked example: Firefox
+// sends it, but Tor Browser sets privacy.donottrackheader.enabled=false, so we
+// must not.
+func TestTorBrowserHeaders(t *testing.T) {
+	pageURL, err := url.Parse("https://example.onion/thread/1")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// build applies the header set under test to a request.
+		build func(*http.Request)
+		want  map[string]string
+	}{
+		{
+			// Captured: GET / from a fresh window.
+			name:  "top-level navigation",
+			build: func(r *http.Request) { setHeaders(r, "") },
+			want: map[string]string{
+				"User-Agent":                *ua,
+				"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language":           "en-US,en;q=0.5",
+				"Accept-Encoding":           "gzip, deflate, br, zstd",
+				"Sec-Gpc":                   "1",
+				"Upgrade-Insecure-Requests": "1",
+				"Sec-Fetch-Dest":            "document",
+				"Sec-Fetch-Mode":            "navigate",
+				"Sec-Fetch-Site":            "none",
+				"Sec-Fetch-User":            "?1",
+				"Priority":                  "u=0, i",
+			},
+		},
+		{
+			// Captured: fetch("/.ttrs/challenge", {method:"POST"}) from page JS.
+			// A browser sends Accept: */* here, not application/json, and
+			// carries an Origin. Referer is suppressed because the page is
+			// a .onion (network.http.referer.hideOnionSource).
+			name:  "challenge POST is an XHR",
+			build: func(r *http.Request) { setXHRHeaders(r, pageURL) },
+			want: map[string]string{
+				"User-Agent":      *ua,
+				"Accept":          "*/*",
+				"Accept-Language": "en-US,en;q=0.5",
+				"Accept-Encoding": "gzip, deflate, br, zstd",
+				"Sec-Gpc":         "1",
+				"Content-Type":    "application/x-www-form-urlencoded",
+				"Origin":          "https://example.onion",
+				"Sec-Fetch-Dest":  "empty",
+				"Sec-Fetch-Mode":  "cors",
+				"Sec-Fetch-Site":  "same-origin",
+				"Priority":        "u=4",
+			},
+		},
+		{
+			// A form submitted from the page: still a navigation, but
+			// same-origin and carrying an Origin.
+			name:  "form submission",
+			build: func(r *http.Request) { setFormPostHeaders(r, pageURL, pageURL.String()) },
+			want: map[string]string{
+				"User-Agent":                *ua,
+				"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language":           "en-US,en;q=0.5",
+				"Accept-Encoding":           "gzip, deflate, br, zstd",
+				"Sec-Gpc":                   "1",
+				"Content-Type":              "application/x-www-form-urlencoded",
+				"Origin":                    "https://example.onion",
+				"Upgrade-Insecure-Requests": "1",
+				"Sec-Fetch-Dest":            "document",
+				"Sec-Fetch-Mode":            "navigate",
+				"Sec-Fetch-Site":            "same-origin",
+				"Sec-Fetch-User":            "?1",
+				"Priority":                  "u=0, i",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", pageURL.String(), nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			tt.build(req)
+
+			for name, want := range tt.want {
+				if got := req.Header.Get(name); got != want {
+					t.Errorf("%s = %q, want %q", name, got, want)
+				}
+			}
+			// Nothing beyond the captured set: an extra header is a tell too.
+			for name := range req.Header {
+				if _, ok := tt.want[name]; !ok {
+					t.Errorf("sending %s: %q, which Tor Browser does not send here",
+						name, req.Header.Get(name))
+				}
+			}
+		})
+	}
+}
+
+func TestRefererHiddenForOnionSource(t *testing.T) {
+	// network.http.referer.hideOnionSource: a page on a .onion never leaks its
+	// URL as a Referer. Every hop we make is referred from a .onion, so sending
+	// one would single us out immediately.
+	tests := []struct {
+		name    string
+		referer string
+		want    string
+	}{
+		{"onion source suppressed", "https://example.onion/page", ""},
+		{"onion source with port suppressed", "https://example.onion:8443/page", ""},
+		{"uppercase onion suppressed", "https://EXAMPLE.ONION/page", ""},
+		{"clearnet source sent", "https://example.com/page", "https://example.com/page"},
+		{"empty referer stays empty", "", ""},
+		{"unparseable referer suppressed", "://nonsense", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "https://example.onion/", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			setReferer(req, tt.referer)
+			if got := req.Header.Get("Referer"); got != tt.want {
+				t.Errorf("Referer = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTorBrowserClientHello(t *testing.T) {
+	spec := torBrowserClientHello()
+
+	// The two suites Tor Browser disables in 001-base-profile.js
+	// (security.ssl3.ecdhe_ecdsa_aes_{128,256}_sha). utls's HelloFirefox_120
+	// offers both, so using the stock preset would advertise cipher suites no
+	// Tor Browser ever advertises -- a positive tell, not just a gap.
+	disabled := map[uint16]string{
+		0xc009: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+		0xc00a: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+		0x0033: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+		0x0039: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+	}
+	for _, c := range spec.CipherSuites {
+		if name, bad := disabled[c]; bad {
+			t.Errorf("offering %s (0x%04x), which Tor Browser disables", name, c)
+		}
+	}
+
+	// Firefox has offered the post-quantum hybrid key share since 132, so a
+	// hello without it does not match the version our User-Agent claims.
+	var haveCurve, haveKeyShare bool
+	var alpn []string
+	for _, e := range spec.Extensions {
+		switch v := e.(type) {
+		case *utls.SupportedCurvesExtension:
+			if len(v.Curves) > 0 && v.Curves[0] == utls.X25519MLKEM768 {
+				haveCurve = true
+			}
+		case *utls.KeyShareExtension:
+			for _, ks := range v.KeyShares {
+				if ks.Group == utls.X25519MLKEM768 {
+					haveKeyShare = true
+				}
+			}
+		case *utls.ALPNExtension:
+			alpn = v.AlpnProtocols
+		}
+	}
+	if !haveCurve {
+		t.Error("X25519MLKEM768 is not the first supported curve")
+	}
+	if !haveKeyShare {
+		t.Error("no X25519MLKEM768 key share offered")
+	}
+	if len(alpn) != 2 || alpn[0] != "h2" || alpn[1] != "http/1.1" {
+		t.Errorf("ALPN = %v, want [h2 http/1.1]", alpn)
+	}
+	// SNI leads the extension list in the capture; ordering is fingerprinted.
+	if len(spec.Extensions) == 0 {
+		t.Fatal("no extensions")
+	}
+	if _, ok := spec.Extensions[0].(*utls.SNIExtension); !ok {
+		t.Errorf("first extension is %T, want *utls.SNIExtension", spec.Extensions[0])
+	}
+
+	// The spec must be usable: ApplyPreset rejects malformed ones.
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	uConn := utls.UClient(c1, &utls.Config{ServerName: "example.onion", InsecureSkipVerify: true}, utls.HelloCustom)
+	if err := uConn.ApplyPreset(torBrowserClientHello()); err != nil {
+		t.Fatalf("ApplyPreset: %v", err)
 	}
 }
 
@@ -567,8 +776,11 @@ func TestSolveTartarusFlow(t *testing.T) {
 			}
 		}
 	}
-	if gotAccept != "application/json" {
-		t.Errorf("POST Accept = %q, want %q", gotAccept, "application/json")
+	// The challenge POST is a fetch() from the interstitial's script, and a
+	// browser sends Accept: */* for that -- application/json is a tell that no
+	// browser produced the request.
+	if gotAccept != "*/*" {
+		t.Errorf("POST Accept = %q, want %q", gotAccept, "*/*")
 	}
 	if gotContentType != "application/x-www-form-urlencoded" {
 		t.Errorf("POST Content-Type = %q, want %q", gotContentType, "application/x-www-form-urlencoded")
