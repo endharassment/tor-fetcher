@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/andybalholm/brotli"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/net/http2"
@@ -175,6 +176,8 @@ func decodeBody(resp *http.Response) ([]byte, error) {
 		}
 		defer gz.Close()
 		return io.ReadAll(gz)
+	case "br":
+		return io.ReadAll(brotli.NewReader(resp.Body))
 	case "deflate":
 		// "deflate" is zlib-wrapped in most servers but raw flate in some, and
 		// the two are only distinguishable by trying.

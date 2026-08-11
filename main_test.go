@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/andybalholm/brotli"
 )
 
 func TestTartarusCheck(t *testing.T) {
@@ -121,9 +123,10 @@ func TestDecodeBody(t *testing.T) {
 	}{
 		{"identity", "", func(b []byte) []byte { return b }, false},
 		{"gzip", "gzip", gzipBytes, false},
+		{"brotli", "br", brotliBytes, false},
 		{"zlib-wrapped deflate", "deflate", zlibBytes, false},
 		{"raw deflate", "deflate", flateBytes, false},
-		{"unsupported", "br", func(b []byte) []byte { return b }, true},
+		{"unsupported", "zstd", func(b []byte) []byte { return b }, true},
 	}
 	const want = "<html>hello</html>"
 	for _, tt := range tests {
@@ -161,6 +164,14 @@ func TestDecodeBody(t *testing.T) {
 func gzipBytes(b []byte) []byte {
 	var buf bytes.Buffer
 	w := gzip.NewWriter(&buf)
+	w.Write(b)
+	w.Close()
+	return buf.Bytes()
+}
+
+func brotliBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
 	w.Write(b)
 	w.Close()
 	return buf.Bytes()
