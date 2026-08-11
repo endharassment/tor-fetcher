@@ -36,6 +36,22 @@ All code lives in a single `main.go` (~810 lines) with tests in `main_test.go`. 
 
 Challenge bodies must be read through `decodeBody`, never `io.ReadAll`: `setHeaders` sets `Accept-Encoding` explicitly (for the Firefox fingerprint), which turns OFF Go's automatic decompression, so a gzipped interstitial otherwise arrives as binary that matches no challenge marker.
 
+### Matching Tor Browser
+
+The tool impersonates Tor Browser, and the bar is **being served the same bytes as any other anonymous Tor user**, not merely not being blocked. So a header we send that Tor Browser doesn't is as much of a tell as one we're missing, and every value is captured rather than guessed.
+
+Two things are pinned to Tor Browser, both in `main.go` and asserted by `TestTorBrowserHeaders` / `TestTorBrowserClientHello`:
+
+- **Request headers** — `setHeaders` (top-level navigation), `setFormPostHeaders` (form submission), `setXHRHeaders` (the Tartarus challenge POST, which in a browser is a `fetch()`). Notable: the document `Accept` carries no image types, `Accept-Language` is `q=0.5` (Firefox 153 says `q=0.9` — do not copy a newer Firefox), `Sec-GPC: 1` is sent, `DNT` is **not** (Tor Browser sets `privacy.donottrackheader.enabled=false`), and `Referer` is suppressed whenever the referring page is a `.onion` (`network.http.referer.hideOnionSource`).
+- **TLS ClientHello** — `torBrowserClientHello()`. utls's stock presets are unusable here: the newest is `HelloFirefox_120`, no Tor Browser was built on Firefox 120, and it offers `TLS_ECDHE_ECDSA_WITH_AES_{128,256}_CBC_SHA` which Tor Browser disables outright — advertising suites no Tor Browser advertises is a positive tell.
+
+**Re-capturing when Tor Browser updates** (the version is in `about:support`; TB 15.0.19 ships Firefox 140.13.0esr):
+
+1. Download the matching stock Firefox ESR from `ftp.mozilla.org`. Tor Browser's own binary won't work for this — TorConnect gates navigation until Tor bootstraps — but TB is that ESR plus prefs, so stock ESR with TB's prefs in a profile `user.js` is equivalent.
+2. Copy the header-relevant prefs out of `000-tor-browser.js` / `001-base-profile.js` (`privacy.resistFingerprinting`, `privacy.globalprivacycontrol.enabled`, `browser.privatebrowsing.autostart`, the `security.ssl3.*` cipher disables, `security.ssl.disable_session_identifiers`) into the profile.
+3. Run it headless against a local listener that dumps raw request bytes. Use `127.0.0.1` or `localhost`, which count as trustworthy origins, so you get the `Sec-Fetch-*` set and the secure `Accept-Encoding` without any cert setup.
+4. For the ClientHello, read the first TLS record off the socket and decode it with `utls.Fingerprinter`. Use a hostname, not an IP — an IP literal suppresses SNI and hides its position in the extension order.
+
 ### Key Dependencies
 
 | Dependency | Purpose |
