@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +62,316 @@ func TestExtractAttr(t *testing.T) {
 					tt.html, tt.attr, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseTartarusChallenge(t *testing.T) {
+	// A live interstitial captured 2026-08-11, which carries the
+	// algorithm/step attributes the older capture didn't.
+	const liveHTML = `<html id="ttrs" class="no-js" data-ttrs-challenge="148f1bab6087189a9c5bbedb2604563d_6a7a78c0_17"
+    data-ttrs-difficulty="17" data-ttrs-steps="1"
+    data-ttrs-algorithm="sha256"
+    data-ttrs-worker-v="ee91eb68">`
+
+	tests := []struct {
+		name           string
+		body           string
+		wantOK         bool
+		wantSalt       string
+		wantDifficulty uint
+	}{
+		{"live interstitial", liveHTML, true, "148f1bab6087189a9c5bbedb2604563d_6a7a78c0_17", 17},
+		{"minimal html", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16">`, true, "abc", 16},
+		{"json salt", `{"salt":"abc","difficulty":16}`, true, "abc", 16},
+		{"json challenge alias", `{"challenge":"abc","difficulty":16}`, true, "abc", 16},
+		{"json string difficulty", `{"salt":"abc","difficulty":"16"}`, true, "abc", 16},
+		{"basedflare page", `<body data-pow="salt#prefix" data-time="1" data-kb="64" data-diff="8">`, false, "", 0},
+		{"unrelated html", `<html><body>hello</body></html>`, false, "", 0},
+		{"missing difficulty", `<html data-ttrs-challenge="abc">`, false, "", 0},
+		// Unsupported PoW rules must read as unparsed rather than yield a nonce
+		// computed the wrong way, which the server would reject.
+		{"unsupported algorithm", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-algorithm="blake3">`, false, "", 0},
+		{"multi-step challenge", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="3">`, false, "", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, ok := parseTartarusChallenge(tt.body)
+			if ok != tt.wantOK {
+				t.Fatalf("parseTartarusChallenge() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if p.salt != tt.wantSalt || p.difficulty != tt.wantDifficulty {
+				t.Errorf("parseTartarusChallenge() = {salt:%q difficulty:%d}, want {salt:%q difficulty:%d}",
+					p.salt, p.difficulty, tt.wantSalt, tt.wantDifficulty)
+			}
+		})
+	}
+}
+
+func TestDecodeBody(t *testing.T) {
+	// setHeaders sets Accept-Encoding itself, which switches OFF Go's automatic
+	// decompression, so every body we read may be compressed.
+	tests := []struct {
+		name     string
+		encoding string
+		encode   func([]byte) []byte
+		wantErr  bool
+	}{
+		{"identity", "", func(b []byte) []byte { return b }, false},
+		{"gzip", "gzip", gzipBytes, false},
+		{"zlib-wrapped deflate", "deflate", zlibBytes, false},
+		{"raw deflate", "deflate", flateBytes, false},
+		{"unsupported", "br", func(b []byte) []byte { return b }, true},
+	}
+	const want = "<html>hello</html>"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.encoding != "" {
+					w.Header().Set("Content-Encoding", tt.encoding)
+				}
+				w.Write(tt.encode([]byte(want)))
+			}))
+			defer ts.Close()
+
+			resp, err := ts.Client().Get(ts.URL + "/")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			defer resp.Body.Close()
+			got, err := decodeBody(resp)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("decodeBody() = %q, want an error for Content-Encoding %q", got, tt.encoding)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeBody: %v", err)
+			}
+			if string(got) != want {
+				t.Errorf("decodeBody() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func gzipBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	w.Write(b)
+	w.Close()
+	return buf.Bytes()
+}
+
+func zlibBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	w.Write(b)
+	w.Close()
+	return buf.Bytes()
+}
+
+func flateBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+	w.Write(b)
+	w.Close()
+	return buf.Bytes()
+}
+
+func TestFetchGzippedTartarusChallenge(t *testing.T) {
+	// Regression: the live site began serving the 203 interstitial gzipped.
+	// setHeaders advertises gzip explicitly, which disables Go's automatic
+	// decompression, so reading the challenge body raw yields binary that
+	// matches no Tartarus marker — and the fetcher misclassified it as
+	// BasedFlare and POSTed a bogus pow_response to the target.
+	const (
+		wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+		wantDiff = "16"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html id="ttrs" data-ttrs-challenge="%s" data-ttrs-difficulty="%s" data-ttrs-steps="1" data-ttrs-algorithm="sha256">`,
+		wantSalt, wantDiff)
+
+	var gotSalt string
+	var sawBasedFlarePost bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "POST":
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			gotSalt = form.Get("salt")
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		case r.URL.Path == "/":
+			if r.Method == "POST" {
+				// A BasedFlare-style solution POST to the target: the exact
+				// wrong turn this test guards against.
+				sawBasedFlarePost = true
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if _, err := r.Cookie("ttrs_clearance"); err != nil {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusNonAuthoritativeInfo)
+				w.Write(gzipBytes([]byte(challengeHTML)))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>real page</html>")
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if sawBasedFlarePost {
+		t.Error("a BasedFlare pow_response was POSTed to the target: the gzipped Tartarus challenge was misclassified")
+	}
+	if gotSalt != wantSalt {
+		t.Errorf("Tartarus POST salt = %q, want %q", gotSalt, wantSalt)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := decodeBody(resp)
+	if err != nil {
+		t.Fatalf("decodeBody: %v", err)
+	}
+	if string(body) != "<html>real page</html>" {
+		t.Errorf("body = %q, want the real page", body)
+	}
+}
+
+func TestFetchTartarusParamsFromChallengeEndpoint(t *testing.T) {
+	// An interstitial that leaves the salt/difficulty out of the HTML (its JS
+	// fetches them) must still be solvable: fall back to the challenge endpoint
+	// rather than misreading the page as a BasedFlare challenge.
+	const wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+
+	var challengeGETs int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "GET":
+			challengeGETs++
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"salt":%q,"difficulty":16}`, wantSalt)
+		case r.URL.Path == "/.ttrs/challenge" && r.Method == "POST":
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		case r.URL.Path == "/":
+			if _, err := r.Cookie("ttrs_clearance"); err != nil {
+				w.WriteHeader(http.StatusNonAuthoritativeInfo)
+				fmt.Fprint(w, `<html id="ttrs"><script src="/.ttrs/worker.js"></script></html>`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>real page</html>")
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if challengeGETs == 0 {
+		t.Error("challenge endpoint was never GET'd for the missing parameters")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestFetchUnrecognizedChallengeFailsLoudly(t *testing.T) {
+	// With no recognizable parameters, solveBasedFlare used to leave difficulty
+	// at 0 — which Check() satisfies at nonce 0 — and POST a garbage
+	// pow_response to the target. Fetch must error instead.
+	var sawPost bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			sawPost = true
+		}
+		if r.URL.Path == "/.ttrs/challenge" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, "<html><body>some challenge we have never seen</body></html>")
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected an error on an unrecognized challenge, got nil")
+	}
+	if sawPost {
+		t.Error("a solution was POSTed for a challenge that was never parsed")
+	}
+}
+
+func TestFetchBasedFlareChallenge(t *testing.T) {
+	// BasedFlare is now matched positively rather than used as the fallback;
+	// make sure a real one still solves. Tiny Argon2 parameters keep it fast.
+	var gotPOW string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			gotPOW = form.Get("pow_response")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html>real page</html>")
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		// data-diff is in bits; 8 bits == 1 leading zero nibble.
+		fmt.Fprint(w, "<html>\n\t<body data-pow=\"salt#prefix\" data-time=\"1\" data-kb=\"64\" data-diff=\"8\" class=\"unknown-attr\">\n</html>")
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	prefix := "salt#prefix#"
+	if !strings.HasPrefix(gotPOW, prefix) {
+		t.Fatalf("pow_response = %q, want prefix %q", gotPOW, prefix)
+	}
+	nonce, err := strconv.Atoi(strings.TrimPrefix(gotPOW, prefix))
+	if err != nil {
+		t.Fatalf("pow_response nonce is not an integer: %v", err)
+	}
+	p := ArgonParams{
+		memory: 64, iterations: 1, parallelism: uint8(*parallelism),
+		keyLength: uint32(*length), difficulty: 1, prefix: "prefix", salt: "salt",
+	}
+	if !p.Check(nonce) {
+		t.Errorf("submitted nonce %d does not satisfy the challenge", nonce)
 	}
 }
 
