@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -151,18 +154,45 @@ func saveCookies(path string, jar http.CookieJar, u *url.URL) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// decodeBody reads a response body, transparently decompressing gzip.
+// decodeBody reads a response body, transparently decompressing the
+// Content-Encodings we advertise in Accept-Encoding. Decoding is our job, not
+// the transport's: Go only decompresses automatically when IT added the
+// Accept-Encoding header, and setHeaders sets it explicitly to match Firefox.
+// Every path that reads a body must go through here — reading a compressed
+// challenge page raw yields binary that matches no challenge marker.
 func decodeBody(resp *http.Response) ([]byte, error) {
-	reader := resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	// HEAD responses carry the encoding header but no body to decode.
+	if resp.Request != nil && resp.Request.Method == "HEAD" {
+		return nil, nil
+	}
+	switch enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); enc {
+	case "", "identity":
+		return io.ReadAll(resp.Body)
+	case "gzip":
 		gz, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("gzip: %w", err)
 		}
 		defer gz.Close()
 		return io.ReadAll(gz)
+	case "deflate":
+		// "deflate" is zlib-wrapped in most servers but raw flate in some, and
+		// the two are only distinguishable by trying.
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+			defer zr.Close()
+			return io.ReadAll(zr)
+		}
+		fr := flate.NewReader(bytes.NewReader(raw))
+		defer fr.Close()
+		return io.ReadAll(fr)
+	default:
+		// Fail loudly rather than hand back bytes that no caller can parse.
+		return nil, fmt.Errorf("unsupported Content-Encoding %q", enc)
 	}
-	return io.ReadAll(reader)
 }
 
 type ArgonParams struct {
@@ -221,6 +251,86 @@ func extractAttr(s, attr string) string {
 		return ""
 	}
 	return s[start : start+end]
+}
+
+// tartarusChallengePath is where Tartarus serves PoW parameters and accepts
+// solutions. It is a dedicated endpoint, never a destination resource.
+const tartarusChallengePath = "/.ttrs/challenge"
+
+// parseTartarusChallenge extracts the PoW salt and difficulty from a Tartarus
+// challenge document, reporting whether it found both. Two shapes are
+// accepted: the HTML interstitial, which carries them as data-ttrs-*
+// attributes, and the JSON object served by tartarusChallengePath.
+func parseTartarusChallenge(body string) (TartarusParams, bool) {
+	if salt := extractAttr(body, "data-ttrs-challenge"); salt != "" {
+		difficulty, err := strconv.Atoi(extractAttr(body, "data-ttrs-difficulty"))
+		if err != nil || difficulty <= 0 {
+			return TartarusParams{}, false
+		}
+		// The interstitial also advertises the hash and a step count.
+		// TartarusParams.Check implements exactly single-step SHA256 over
+		// salt+nonce, so treat anything else as unparsed: the caller then
+		// errors out instead of submitting a nonce computed under the wrong
+		// rules. Absent attributes mean the defaults.
+		if algo := extractAttr(body, "data-ttrs-algorithm"); algo != "" && algo != "sha256" {
+			slog.Debug("unsupported tartarus algorithm", "algorithm", algo)
+			return TartarusParams{}, false
+		}
+		if steps := extractAttr(body, "data-ttrs-steps"); steps != "" && steps != "1" {
+			slog.Debug("unsupported tartarus step count", "steps", steps)
+			return TartarusParams{}, false
+		}
+		return TartarusParams{salt: salt, difficulty: uint(difficulty)}, true
+	}
+
+	var j struct {
+		Salt       string `json:"salt"`
+		Challenge  string `json:"challenge"`
+		Difficulty any    `json:"difficulty"`
+	}
+	if err := json.Unmarshal([]byte(body), &j); err != nil {
+		return TartarusParams{}, false
+	}
+	salt := j.Salt
+	if salt == "" {
+		salt = j.Challenge
+	}
+	var difficulty int
+	switch d := j.Difficulty.(type) {
+	case float64:
+		difficulty = int(d)
+	case string:
+		difficulty, _ = strconv.Atoi(d)
+	}
+	if salt == "" || difficulty <= 0 {
+		return TartarusParams{}, false
+	}
+	return TartarusParams{salt: salt, difficulty: uint(difficulty)}, true
+}
+
+// tartarusChallengeParams asks tartarusChallengePath for the PoW parameters
+// directly. Interstitials that leave the salt/difficulty out of the HTML (the
+// page's JS fetches them) are otherwise unsolvable. Safe in HEAD mode: the
+// endpoint is never the destination resource, so it can't download the body a
+// HEAD probe exists to avoid.
+func (tc *TorClient) tartarusChallengeParams(requestURL *url.URL, referer string) (TartarusParams, error) {
+	chURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
+	resp, err := tc.Get(chURL, referer)
+	if err != nil {
+		return TartarusParams{}, fmt.Errorf("fetching %s: %w", chURL, err)
+	}
+	body, err := decodeBody(resp)
+	resp.Body.Close()
+	tracef("GET %s -> %d %s (challenge params)", chURL, resp.StatusCode, http.StatusText(resp.StatusCode))
+	if err != nil {
+		return TartarusParams{}, fmt.Errorf("reading %s: %w", chURL, err)
+	}
+	p, ok := parseTartarusChallenge(string(body))
+	if !ok {
+		return TartarusParams{}, fmt.Errorf("no challenge parameters at %s (HTTP %d), body starts: %.200q",
+			chURL, resp.StatusCode, body)
+	}
+	return p, nil
 }
 
 // tartarusChallengeURL reports the URL to GET for a Tartarus challenge's
@@ -504,56 +614,63 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 			}
 			tracef("GET %s -> %d %s (challenge body)", fetchURL, chResp.StatusCode, http.StatusText(chResp.StatusCode))
 		}
-		bodyBytes, err := io.ReadAll(chResp.Body)
+		bodyBytes, err := decodeBody(chResp)
 		chResp.Body.Close()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading challenge body from %s: %w", fetchURL, err)
 		}
 		body := string(bodyBytes)
 
-		if strings.Contains(body, "data-ttrs-challenge") {
+		// Identify the challenge by a POSITIVE match on each type. BasedFlare
+		// must never be the fallback: solveBasedFlare parses no parameters out
+		// of an unrecognized body, leaving difficulty 0, which Check() accepts
+		// at nonce 0 — so an unknown challenge would silently POST a garbage
+		// pow_response to the target instead of failing.
+		p, ok := parseTartarusChallenge(body)
+		switch {
+		case ok:
 			tracef("  -> Tartarus challenge")
-			challengeResp, err := tc.solveTartarus(method, requestURL, body, reqBody)
+		case strings.Contains(body, "data-pow="):
+			tracef("  -> BasedFlare challenge")
+			bfResp, err := tc.solveBasedFlare(requestURL, body)
 			if err != nil {
 				return nil, err
 			}
-			// solveTartarus returns the re-GET response; loop to
-			// handle further redirects or challenges on the new domain.
-			if loc := challengeResp.Header.Get("Location"); loc != "" &&
-				(challengeResp.StatusCode >= 300 && challengeResp.StatusCode < 400) {
-				challengeResp.Body.Close()
-				resolved, err := requestURL.Parse(loc)
-				if err != nil {
-					return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
-				}
-				tracef("  -> redirect after challenge to %s", resolved)
-				slog.Debug("following redirect after challenge", "from", requestURL, "to", resolved)
-				currentReferer = requestURL.String()
-				currentURL = resolved.String()
-				continue
+			return finalize(bfResp)
+		default:
+			p, err = tc.tartarusChallengeParams(requestURL, currentReferer)
+			if err != nil {
+				return nil, fmt.Errorf("unrecognized %d challenge at %s: no BasedFlare parameters in the body and %w; body starts: %.200q",
+					resp.StatusCode, fetchURL, err, body)
 			}
-			return finalize(challengeResp)
+			tracef("  -> Tartarus challenge (params from %s)", tartarusChallengePath)
 		}
-		tracef("  -> BasedFlare challenge")
-		bfResp, err := tc.solveBasedFlare(requestURL, body)
+
+		challengeResp, err := tc.solveTartarus(method, requestURL, p, reqBody)
 		if err != nil {
 			return nil, err
 		}
-		return finalize(bfResp)
+		// solveTartarus returns the re-GET response; loop to
+		// handle further redirects or challenges on the new domain.
+		if loc := challengeResp.Header.Get("Location"); loc != "" &&
+			(challengeResp.StatusCode >= 300 && challengeResp.StatusCode < 400) {
+			challengeResp.Body.Close()
+			resolved, err := requestURL.Parse(loc)
+			if err != nil {
+				return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
+			}
+			tracef("  -> redirect after challenge to %s", resolved)
+			slog.Debug("following redirect after challenge", "from", requestURL, "to", resolved)
+			currentReferer = requestURL.String()
+			currentURL = resolved.String()
+			continue
+		}
+		return finalize(challengeResp)
 	}
 	return nil, fmt.Errorf("too many redirects/challenges")
 }
 
-func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body string, reqBody []byte) (*http.Response, error) {
-	salt := extractAttr(body, "data-ttrs-challenge")
-	diffStr := extractAttr(body, "data-ttrs-difficulty")
-	difficulty, err := strconv.Atoi(diffStr)
-	if err != nil {
-		return nil, fmt.Errorf("parsing tartarus difficulty: %w", err)
-	}
-
-	p := TartarusParams{salt: salt, difficulty: uint(difficulty)}
-
+func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p TartarusParams, reqBody []byte) (*http.Response, error) {
 	// Brute-force SHA256 PoW from nonce=0.
 	var nonce int
 	for n := 0; ; n++ {
@@ -564,11 +681,11 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, body stri
 	}
 
 	// POST the solution to /.ttrs/challenge as an XHR.
-	challengeURL := fmt.Sprintf("%s://%s/.ttrs/challenge", requestURL.Scheme, requestURL.Host)
+	challengeURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
 	values := url.Values{}
-	values.Set("salt", salt)
+	values.Set("salt", p.salt)
 	values.Set("nonce", strconv.Itoa(nonce))
-	slog.Debug("tartarus challenge solved", "salt", salt, "difficulty", difficulty, "nonce", nonce)
+	slog.Debug("tartarus challenge solved", "salt", p.salt, "difficulty", p.difficulty, "nonce", nonce)
 	req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("building tartarus POST: %w", err)
@@ -607,20 +724,34 @@ func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Re
 	var p ArgonParams
 	var pow string
 	for _, l := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(l, "\t<body data") {
+		// Match on the attribute rather than the line's exact indentation, so a
+		// template whitespace change doesn't silently zero out the parameters.
+		if !strings.Contains(l, "data-pow=") {
 			continue
 		}
-		parts := strings.Split(l[len("\t<body "):len(l)-1], " ")
+		start := strings.Index(l, "<body ")
+		if start == -1 {
+			continue
+		}
+		attrs := l[start+len("<body "):]
+		if end := strings.Index(attrs, ">"); end != -1 {
+			attrs = attrs[:end]
+		}
 
-		for _, part := range parts {
-			split := strings.SplitN(part, "=", 2)
-			key := split[0]
+		for _, part := range strings.Fields(attrs) {
+			key, value, found := strings.Cut(part, "=")
+			if !found {
+				continue
+			}
 			// Trim the quotes on either side of the value.
-			value := split[1][1 : len(split[1])-1]
+			value = strings.Trim(value, `"`)
 			switch key {
 			case "data-pow":
 				pow = value
 				params := strings.Split(pow, "#")
+				if len(params) != 2 {
+					return nil, fmt.Errorf("malformed basedflare data-pow %q, want salt#prefix", pow)
+				}
 				p.salt = params[0]
 				p.prefix = params[1]
 			case "data-time":
@@ -642,12 +773,22 @@ func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Re
 				}
 				p.memory = uint32(mem)
 			default:
-				return nil, fmt.Errorf("unexpected basedflare key: %s", key)
+				// Tolerate attributes we don't consume (class, onload, ...);
+				// the completeness check below is what guards correctness.
+				slog.Debug("ignoring basedflare body attribute", "key", key, "value", value)
 			}
 		}
 		p.parallelism = uint8(*parallelism)
 		p.keyLength = uint32(*length)
 		break
+	}
+
+	// Refuse to "solve" a challenge we couldn't read. With zero parameters
+	// difficulty is 0, which Check() accepts at nonce 0, so submitting anyway
+	// posts a garbage pow_response that the server rejects far from the cause.
+	if pow == "" || p.iterations == 0 || p.memory == 0 {
+		return nil, fmt.Errorf("incomplete BasedFlare challenge parameters (pow=%q time=%d kb=%d diff=%d); body starts: %.200q",
+			pow, p.iterations, p.memory, p.difficulty, body)
 	}
 
 	// Run the POW, single-threaded in case another circuit is running.

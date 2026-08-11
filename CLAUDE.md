@@ -32,7 +32,9 @@ All code lives in a single `main.go` (~460 lines) with tests in `main_test.go`. 
 
 ### Challenge Flow
 
-`Fetch()` detects challenges via HTTP 203/403 status codes. It checks for `data-ttrs-challenge` HTML attribute to distinguish Tartarus from BasedFlare, then calls the appropriate solver (`solveTartarus` or `solveBasedFlare`). Solvers brute-force nonces, POST the solution, and the resulting clearance cookie allows the re-GET to succeed.
+`Fetch()` detects challenges via HTTP 203/403 status codes (plus the API-style 401 + `Www-Authenticate: Tartarus`). Each challenge type is matched **positively**: Tartarus via `parseTartarusChallenge` (`data-ttrs-*` attributes, or the JSON served by `/.ttrs/challenge`), BasedFlare via `data-pow=`. Neither is the fallback — an unrecognized body errors out, because a solver handed no parameters would otherwise submit a bogus zero-difficulty solution. When an interstitial carries no inline parameters, `tartarusChallengeParams` GETs `/.ttrs/challenge` for them. Solvers brute-force nonces, POST the solution, and the resulting clearance cookie allows the re-GET to succeed.
+
+Challenge bodies must be read through `decodeBody`, never `io.ReadAll`: `setHeaders` sets `Accept-Encoding` explicitly (for the Firefox fingerprint), which turns OFF Go's automatic decompression, so a gzipped interstitial otherwise arrives as binary that matches no challenge marker.
 
 ### Key Dependencies
 
