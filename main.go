@@ -997,9 +997,18 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 			lastErr = fmt.Errorf("%w (fetching a fresh challenge to retry also failed: %v)", lastErr, err)
 			break
 		}
+		// The "fresh" challenge can come back with the SAME salt (observed
+		// live: the challenge endpoint's salt is itself coarsely time-
+		// bucketed, and a whole retry sequence can complete inside one
+		// bucket). Resetting the nonce search to 0 in that case would just
+		// resubmit the exact nonce that already lost -- only restart the
+		// search when the salt actually changed; otherwise keep advancing
+		// through the same search we were already running.
+		if newP.salt != p.salt {
+			nextNonce = 0
+			sameSaltRetries = 0
+		}
 		p = newP
-		nextNonce = 0
-		sameSaltRetries = 0
 	}
 	return nil, lastErr
 }
