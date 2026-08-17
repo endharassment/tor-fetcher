@@ -1039,6 +1039,85 @@ func TestSolveTartarusFallsBackToFreshChallengeAfterSameSaltRetries(t *testing.T
 	}
 }
 
+func TestSolveTartarusKeepsAdvancingWhenFreshChallengeMatchesSameSalt(t *testing.T) {
+	// Observed live in production: the fallback "fresh challenge" fetch can
+	// come back with the SAME salt as before (the challenge endpoint's salt
+	// is itself coarsely time-bucketed, and a whole retry sequence can
+	// complete inside one bucket). If solveTartarus blindly restarted the
+	// nonce search from 0 in that case, it would resubmit the exact nonce
+	// that already lost -- wasting the final attempt on a submission that's
+	// certain to fail again. It must instead keep advancing the same search.
+	const (
+		salt     = "aaaa1111aaaa1111aaaa1111aaaa1111_11111111_16"
+		wantDiff = 16
+	)
+	p := TartarusParams{salt: salt, difficulty: wantDiff}
+	var validNonces []int
+	for n := 0; len(validNonces) < 4; n++ {
+		if p.Check(n) {
+			validNonces = append(validNonces, n)
+		}
+	}
+
+	var submittedNonces []int
+	var challengeEndpointGETs int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			if _, err := r.Cookie("ttrs_clearance"); err == nil {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "<html>real page</html>")
+				return
+			}
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprintf(w, `<html data-ttrs-challenge=%q data-ttrs-difficulty="%d"></html>`, salt, wantDiff)
+		case r.Method == "GET" && r.URL.Path == "/.ttrs/challenge":
+			challengeEndpointGETs++
+			// The "fresh" challenge is, infuriatingly, the SAME salt.
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"salt":%q,"difficulty":%d}`, salt, wantDiff)
+		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			nonce, _ := strconv.Atoi(form.Get("nonce"))
+			submittedNonces = append(submittedNonces, nonce)
+			// Only the 4th distinct valid nonce redeems -- forces the
+			// fallback tier to fire and prove it doesn't repeat nonce[0].
+			if nonce != validNonces[3] {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"success":false,"reason":"invalid_solution","action":"retry"}`)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if challengeEndpointGETs != 1 {
+		t.Errorf("challenge endpoint GET count = %d, want 1 (the fallback tier firing once)", challengeEndpointGETs)
+	}
+	if len(submittedNonces) != len(validNonces) {
+		t.Fatalf("submitted %d nonces, want %d: %v", len(submittedNonces), len(validNonces), submittedNonces)
+	}
+	for i, want := range validNonces {
+		if submittedNonces[i] != want {
+			t.Errorf("submitted nonce[%d] = %d, want %d (the search must keep advancing, not restart at nonce[0] after the same-salt fallback fetch): all submitted = %v",
+				i, submittedNonces[i], want, submittedNonces)
+		}
+	}
+}
+
 func TestSolveTartarusGivesUpAfterMaxRetries(t *testing.T) {
 	// A challenge that's rejected for a reason other than a resolvable race
 	// must still fail loudly rather than retrying forever.
