@@ -269,39 +269,53 @@ func extractAttr(s, attr string) string {
 // solutions. It is a dedicated endpoint, never a destination resource.
 const tartarusChallengePath = "/.ttrs/challenge"
 
+// checkTartarusCapability reports whether TartarusParams.Check can evaluate a
+// challenge advertising the given algorithm/steps. Check implements exactly
+// single-step SHA256 over salt+nonce, so anything else must be rejected
+// explicitly: silently treating an unsupported algorithm or step count as
+// sha256/steps=1 would submit a nonce that looks locally valid but is wrong
+// -- a worse failure than refusing outright, since it burns a solve attempt
+// (and a clearance-granting circuit) without any indication of why. Absent
+// attributes mean the defaults, which are supported.
+func checkTartarusCapability(algorithm, steps string) error {
+	if algorithm != "" && algorithm != "sha256" {
+		return fmt.Errorf("unsupported tartarus algorithm %q (only sha256 is implemented)", algorithm)
+	}
+	if steps != "" && steps != "1" {
+		return fmt.Errorf("unsupported tartarus step count %q (only steps=1 is implemented)", steps)
+	}
+	return nil
+}
+
 // parseTartarusChallenge extracts the PoW salt and difficulty from a Tartarus
-// challenge document, reporting whether it found both. Two shapes are
-// accepted: the HTML interstitial, which carries them as data-ttrs-*
-// attributes, and the JSON object served by tartarusChallengePath.
-func parseTartarusChallenge(body string) (TartarusParams, bool) {
+// challenge document. Two shapes are accepted: the HTML interstitial, which
+// carries them as data-ttrs-* attributes, and the JSON object served by
+// tartarusChallengePath. A non-nil error means either the document isn't a
+// Tartarus challenge at all, or it is one but advertises PoW rules Check
+// can't evaluate -- both must be treated the same way by the caller: don't
+// submit a nonce.
+func parseTartarusChallenge(body string) (TartarusParams, error) {
 	if salt := extractAttr(body, "data-ttrs-challenge"); salt != "" {
-		difficulty, err := strconv.Atoi(extractAttr(body, "data-ttrs-difficulty"))
+		difficultyStr := extractAttr(body, "data-ttrs-difficulty")
+		difficulty, err := strconv.Atoi(difficultyStr)
 		if err != nil || difficulty <= 0 {
-			return TartarusParams{}, false
+			return TartarusParams{}, fmt.Errorf("data-ttrs-challenge present but data-ttrs-difficulty is missing or invalid (%q)", difficultyStr)
 		}
-		// The interstitial also advertises the hash and a step count.
-		// TartarusParams.Check implements exactly single-step SHA256 over
-		// salt+nonce, so treat anything else as unparsed: the caller then
-		// errors out instead of submitting a nonce computed under the wrong
-		// rules. Absent attributes mean the defaults.
-		if algo := extractAttr(body, "data-ttrs-algorithm"); algo != "" && algo != "sha256" {
-			slog.Debug("unsupported tartarus algorithm", "algorithm", algo)
-			return TartarusParams{}, false
+		if err := checkTartarusCapability(extractAttr(body, "data-ttrs-algorithm"), extractAttr(body, "data-ttrs-steps")); err != nil {
+			return TartarusParams{}, err
 		}
-		if steps := extractAttr(body, "data-ttrs-steps"); steps != "" && steps != "1" {
-			slog.Debug("unsupported tartarus step count", "steps", steps)
-			return TartarusParams{}, false
-		}
-		return TartarusParams{salt: salt, difficulty: uint(difficulty)}, true
+		return TartarusParams{salt: salt, difficulty: uint(difficulty)}, nil
 	}
 
 	var j struct {
 		Salt       string `json:"salt"`
 		Challenge  string `json:"challenge"`
 		Difficulty any    `json:"difficulty"`
+		Algorithm  string `json:"algorithm"`
+		Steps      any    `json:"steps"`
 	}
 	if err := json.Unmarshal([]byte(body), &j); err != nil {
-		return TartarusParams{}, false
+		return TartarusParams{}, fmt.Errorf("no data-ttrs-challenge attribute, and not JSON either: %w", err)
 	}
 	salt := j.Salt
 	if salt == "" {
@@ -315,9 +329,19 @@ func parseTartarusChallenge(body string) (TartarusParams, bool) {
 		difficulty, _ = strconv.Atoi(d)
 	}
 	if salt == "" || difficulty <= 0 {
-		return TartarusParams{}, false
+		return TartarusParams{}, fmt.Errorf("JSON challenge missing salt/challenge or difficulty")
 	}
-	return TartarusParams{salt: salt, difficulty: uint(difficulty)}, true
+	var steps string
+	switch s := j.Steps.(type) {
+	case float64:
+		steps = strconv.Itoa(int(s))
+	case string:
+		steps = s
+	}
+	if err := checkTartarusCapability(j.Algorithm, steps); err != nil {
+		return TartarusParams{}, err
+	}
+	return TartarusParams{salt: salt, difficulty: uint(difficulty)}, nil
 }
 
 // tartarusChallengeParams asks tartarusChallengePath for the PoW parameters
@@ -337,10 +361,10 @@ func (tc *TorClient) tartarusChallengeParams(requestURL *url.URL, referer string
 	if err != nil {
 		return TartarusParams{}, fmt.Errorf("reading %s: %w", chURL, err)
 	}
-	p, ok := parseTartarusChallenge(string(body))
-	if !ok {
-		return TartarusParams{}, fmt.Errorf("no challenge parameters at %s (HTTP %d), body starts: %.200q",
-			chURL, resp.StatusCode, body)
+	p, err := parseTartarusChallenge(string(body))
+	if err != nil {
+		return TartarusParams{}, fmt.Errorf("no usable challenge parameters at %s (HTTP %d): %w; full body: %q",
+			chURL, resp.StatusCode, err, body)
 	}
 	return p, nil
 }
@@ -837,9 +861,9 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 		// of an unrecognized body, leaving difficulty 0, which Check() accepts
 		// at nonce 0 — so an unknown challenge would silently POST a garbage
 		// pow_response to the target instead of failing.
-		p, ok := parseTartarusChallenge(body)
+		p, parseErr := parseTartarusChallenge(body)
 		switch {
-		case ok:
+		case parseErr == nil:
 			tracef("  -> Tartarus challenge")
 		case strings.Contains(body, "data-pow="):
 			tracef("  -> BasedFlare challenge")
@@ -849,10 +873,11 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 			}
 			return finalize(bfResp)
 		default:
-			p, err = tc.tartarusChallengeParams(requestURL, currentReferer)
-			if err != nil {
-				return nil, fmt.Errorf("unrecognized %d challenge at %s: no BasedFlare parameters in the body and %w; body starts: %.200q",
-					resp.StatusCode, fetchURL, err, body)
+			var chErr error
+			p, chErr = tc.tartarusChallengeParams(requestURL, currentReferer)
+			if chErr != nil {
+				return nil, fmt.Errorf("unrecognized %d challenge at %s: no BasedFlare parameters in the body; interstitial body unusable (%v); challenge endpoint also failed: %w; full interstitial body: %q",
+					resp.StatusCode, fetchURL, parseErr, chErr, body)
 			}
 			tracef("  -> Tartarus challenge (params from %s)", tartarusChallengePath)
 		}
@@ -913,7 +938,8 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 	slog.Debug("tartarus POST response", "status", postResp.StatusCode, "body", string(postBody))
 	slog.Debug("tartarus POST cookies", "set-cookie", postResp.Header["Set-Cookie"])
 	if postResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tartarus challenge POST returned %d", postResp.StatusCode)
+		return nil, fmt.Errorf("tartarus challenge POST to %s returned %d (submitted salt=%s difficulty=%d nonce=%d): response body: %q",
+			challengeURL, postResp.StatusCode, p.salt, p.difficulty, nonce, postBody)
 	}
 
 	if tc.c.Jar != nil {

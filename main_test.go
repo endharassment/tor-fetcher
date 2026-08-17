@@ -97,12 +97,17 @@ func TestParseTartarusChallenge(t *testing.T) {
 		// computed the wrong way, which the server would reject.
 		{"unsupported algorithm", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-algorithm="blake3">`, false, "", 0},
 		{"multi-step challenge", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="3">`, false, "", 0},
+		{"json unsupported algorithm", `{"salt":"abc","difficulty":16,"algorithm":"argon2id"}`, false, "", 0},
+		{"json multi-step challenge", `{"salt":"abc","difficulty":16,"steps":5}`, false, "", 0},
+		{"json multi-step challenge, string steps", `{"salt":"abc","difficulty":16,"steps":"5"}`, false, "", 0},
+		{"json steps=1 is fine", `{"salt":"abc","difficulty":16,"steps":1,"algorithm":"sha256"}`, true, "abc", 16},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, ok := parseTartarusChallenge(tt.body)
+			p, err := parseTartarusChallenge(tt.body)
+			ok := err == nil
 			if ok != tt.wantOK {
-				t.Fatalf("parseTartarusChallenge() ok = %v, want %v", ok, tt.wantOK)
+				t.Fatalf("parseTartarusChallenge() err = %v, want ok = %v", err, tt.wantOK)
 			}
 			if !ok {
 				return
@@ -622,6 +627,55 @@ func TestFetchUnrecognizedChallengeFailsLoudly(t *testing.T) {
 	}
 }
 
+func TestFetchMultiStepChallengeFailsLoudlyWithDiagnostics(t *testing.T) {
+	// A live site briefly served data-ttrs-steps="5", which
+	// TartarusParams.Check cannot evaluate (it only implements single-step
+	// SHA256). A 200-char-truncated error destroyed the only captured
+	// evidence of what happened in production; this locks in that the full
+	// body and the specific rejection reason both survive into the returned
+	// error, and that no nonce is ever submitted for a challenge shape we
+	// can't correctly solve.
+	const (
+		wantSalt = "3238d142bb6fe535be51b1b19a95a69d_6a822332_21"
+		wantDiff = "21"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html id="ttrs" class="no-js no-scripts" data-ttrs-challenge=%q data-ttrs-difficulty=%q data-ttrs-steps="5" data-ttrs-algorithm="sha256" data-ttrs-worker-v="ee91eb68">`,
+		wantSalt, wantDiff)
+
+	var sawPost bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			sawPost = true
+		}
+		if r.URL.Path == "/.ttrs/challenge" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNonAuthoritativeInfo)
+		fmt.Fprint(w, challengeHTML)
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected an error on a steps=5 challenge, got nil")
+	}
+	if sawPost {
+		t.Error("a solution was POSTed for a challenge whose PoW rules we can't evaluate")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, wantSalt) {
+		t.Errorf("error %q does not contain the challenge salt %q -- the diagnosable body was lost", msg, wantSalt)
+	}
+	if !strings.Contains(msg, `"5"`) {
+		t.Errorf("error %q does not mention the unsupported step count", msg)
+	}
+}
+
 func TestFetchBasedFlareChallenge(t *testing.T) {
 	// BasedFlare is now matched positively rather than used as the fallback;
 	// make sure a real one still solves. Tiny Argon2 parameters keep it fast.
@@ -787,6 +841,51 @@ func TestSolveTartarusFlow(t *testing.T) {
 	}
 	if gotReferer == "" {
 		t.Error("POST Referer is empty, want original page URL")
+	}
+}
+
+func TestSolveTartarusPOSTFailureIncludesDiagnostics(t *testing.T) {
+	// A production failure once surfaced only as "tartarus challenge POST
+	// returned 400" -- no salt, difficulty, nonce, or response body, so
+	// there was nothing to diagnose after the fact. A wrong-but-locally-
+	// valid-looking nonce is exactly what a steps>1 challenge parsed under
+	// the steps=1 assumption would produce, so the failure message must
+	// carry enough to tell that apart from other causes (stale salt, clock
+	// skew, etc).
+	const (
+		wantSalt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+		wantDiff = "16"
+	)
+	challengeHTML := fmt.Sprintf(
+		`<html data-ttrs-challenge="%s" data-ttrs-difficulty="%s"></html>`,
+		wantSalt, wantDiff)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprint(w, challengeHTML)
+		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":"challenge expired"}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected an error when the challenge POST is rejected, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{wantSalt, wantDiff, "400", "challenge expired"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not contain %q", msg, want)
+		}
 	}
 }
 
