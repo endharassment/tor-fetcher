@@ -906,53 +906,102 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 	return nil, fmt.Errorf("too many redirects/challenges")
 }
 
+// tartarusMaxSolveAttempts bounds the retry-on-server-signal loop in
+// solveTartarus: a rejected submission can carry an explicit action:"retry",
+// and that's real, bounded, self-resolving signal rather than an unknown
+// failure mode, so it's safe to retry automatically -- but bounded, so a
+// challenge that's rejected for some other reason still fails loudly rather
+// than looping.
+const tartarusMaxSolveAttempts = 4
+
+// tartarusMaxSameSaltRetries bounds how many of those retries continue
+// brute-forcing the SAME salt for the next valid nonce, which is cheap (no
+// extra network round trip): server-side rejection was confirmed live to be
+// scoped to the specific (salt, nonce) pair, not the salt as a whole, so
+// resuming the same search past a rejected nonce is normally enough. If it
+// still isn't after a couple of tries, something else may be going on, so
+// the remaining attempts escalate to fetching an entirely fresh challenge
+// instead of exhausting the whole budget on a salt that might never redeem.
+const tartarusMaxSameSaltRetries = 2
+
 func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p TartarusParams, reqBody []byte) (*http.Response, error) {
-	// Brute-force SHA256 PoW from nonce=0.
-	var nonce int
-	for n := 0; ; n++ {
-		if p.Check(n) {
-			nonce = n
+	referer := requestURL.String()
+	var lastErr error
+	nextNonce := 0 // resume point for the current salt's brute-force search
+	sameSaltRetries := 0
+	for attempt := 1; attempt <= tartarusMaxSolveAttempts; attempt++ {
+		// Brute-force SHA256 PoW, resuming past any nonce already rejected
+		// for this salt rather than restarting from 0 (which would just
+		// find that same rejected nonce again).
+		var nonce int
+		for n := nextNonce; ; n++ {
+			if p.Check(n) {
+				nonce = n
+				break
+			}
+		}
+		nextNonce = nonce + 1
+
+		// POST the solution to /.ttrs/challenge as an XHR.
+		challengeURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
+		values := url.Values{}
+		values.Set("salt", p.salt)
+		values.Set("nonce", strconv.Itoa(nonce))
+		slog.Debug("tartarus challenge solved", "salt", p.salt, "difficulty", p.difficulty, "nonce", nonce, "attempt", attempt)
+		req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("building tartarus POST: %w", err)
+		}
+		// In a browser this POST is a fetch() issued by the interstitial's
+		// script, so it carries the XHR header set, not a page navigation's.
+		setXHRHeaders(req, requestURL)
+		postResp, err := tc.c.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("posting tartarus solution: %w", err)
+		}
+		postBody, _ := io.ReadAll(postResp.Body)
+		postResp.Body.Close()
+		slog.Debug("tartarus POST response", "status", postResp.StatusCode, "body", string(postBody))
+		slog.Debug("tartarus POST cookies", "set-cookie", postResp.Header["Set-Cookie"])
+
+		if postResp.StatusCode == http.StatusOK {
+			if tc.c.Jar != nil {
+				slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
+			}
+			// Re-fetch the original target with the CALLER'S method and body
+			// now that the ttrs_clearance cookie is set (the jar preserves
+			// it). Using the caller's method rather than a hardcoded GET
+			// means a HEAD probe never downloads the destination body --
+			// essential when the caller must learn a resource's status
+			// without fetching the resource itself. For GET this is
+			// unchanged.
+			return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
+		}
+
+		lastErr = fmt.Errorf("tartarus challenge POST to %s returned %d (submitted salt=%s difficulty=%d nonce=%d, attempt %d/%d): response body: %q",
+			challengeURL, postResp.StatusCode, p.salt, p.difficulty, nonce, attempt, tartarusMaxSolveAttempts, postBody)
+
+		var reject struct {
+			Action string `json:"action"`
+		}
+		if err := json.Unmarshal(postBody, &reject); err != nil || reject.Action != "retry" || attempt == tartarusMaxSolveAttempts {
 			break
 		}
-	}
 
-	// POST the solution to /.ttrs/challenge as an XHR.
-	challengeURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
-	values := url.Values{}
-	values.Set("salt", p.salt)
-	values.Set("nonce", strconv.Itoa(nonce))
-	slog.Debug("tartarus challenge solved", "salt", p.salt, "difficulty", p.difficulty, "nonce", nonce)
-	req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("building tartarus POST: %w", err)
+		if sameSaltRetries < tartarusMaxSameSaltRetries {
+			sameSaltRetries++
+			continue
+		}
+		newP, err := tc.tartarusChallengeParams(requestURL, referer)
+		if err != nil {
+			lastErr = fmt.Errorf("%w (fetching a fresh challenge to retry also failed: %v)", lastErr, err)
+			break
+		}
+		p = newP
+		nextNonce = 0
+		sameSaltRetries = 0
 	}
-	// In a browser this POST is a fetch() issued by the interstitial's script,
-	// so it carries the XHR header set, not a page navigation's.
-	setXHRHeaders(req, requestURL)
-	postResp, err := tc.c.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("posting tartarus solution: %w", err)
-	}
-	postBody, _ := io.ReadAll(postResp.Body)
-	postResp.Body.Close()
-	slog.Debug("tartarus POST response", "status", postResp.StatusCode, "body", string(postBody))
-	slog.Debug("tartarus POST cookies", "set-cookie", postResp.Header["Set-Cookie"])
-	if postResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tartarus challenge POST to %s returned %d (submitted salt=%s difficulty=%d nonce=%d): response body: %q",
-			challengeURL, postResp.StatusCode, p.salt, p.difficulty, nonce, postBody)
-	}
-
-	if tc.c.Jar != nil {
-		slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
-	}
-
-	// Re-fetch the original target with the CALLER'S method and body now that
-	// the ttrs_clearance cookie is set (the jar preserves it). Using the
-	// caller's method rather than a hardcoded GET means a HEAD probe never
-	// downloads the destination body — essential when the caller must learn a
-	// resource's status without fetching the resource itself. For GET this is
-	// unchanged.
-	return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
+	return nil, lastErr
 }
 
 func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
