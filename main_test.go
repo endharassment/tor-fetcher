@@ -889,6 +889,112 @@ func TestSolveTartarusPOSTFailureIncludesDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSolveTartarusRetriesOnServerSignaledRetry(t *testing.T) {
+	// Reproduced live: a challenge salt handed to more than one concurrent
+	// requester is only redeemable by the first submission; the rest get
+	// {"success":false,"reason":"invalid_solution","action":"retry"}. That's
+	// a server-declared, bounded, self-resolving race -- fetching a fresh
+	// challenge draws a new salt -- so solveTartarus should retry
+	// automatically rather than failing on the first rejection.
+	const (
+		staleSalt = "aaaa1111aaaa1111aaaa1111aaaa1111_11111111_16"
+		freshSalt = "bbbb2222bbbb2222bbbb2222bbbb2222_22222222_16"
+		wantDiff  = 16
+	)
+
+	var postCount int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			if _, err := r.Cookie("ttrs_clearance"); err == nil {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "<html>real page</html>")
+				return
+			}
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprintf(w, `<html data-ttrs-challenge=%q data-ttrs-difficulty="%d"></html>`, staleSalt, wantDiff)
+		case r.Method == "GET" && r.URL.Path == "/.ttrs/challenge":
+			// The retry path fetches a fresh salt from the JSON endpoint.
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"salt":%q,"difficulty":%d}`, freshSalt, wantDiff)
+		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+			postCount++
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			if form.Get("salt") == staleSalt {
+				// Simulate losing the race on the first (stale) salt.
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"success":false,"reason":"invalid_solution","action":"retry"}`)
+				return
+			}
+			// The retried submission, on the fresh salt, succeeds.
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if postCount != 2 {
+		t.Errorf("challenge POST count = %d, want 2 (one lost race, one retry that won)", postCount)
+	}
+	body, err := decodeBody(resp)
+	if err != nil {
+		t.Fatalf("decodeBody: %v", err)
+	}
+	if string(body) != "<html>real page</html>" {
+		t.Errorf("body = %q, want the real page", body)
+	}
+}
+
+func TestSolveTartarusGivesUpAfterMaxRetries(t *testing.T) {
+	// A challenge that's rejected for a reason other than a resolvable race
+	// must still fail loudly rather than retrying forever.
+	const wantDiff = 16
+
+	var postCount int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprintf(w, `<html data-ttrs-challenge="cccc3333cccc3333cccc3333cccc3333_33333333_16" data-ttrs-difficulty="%d"></html>`, wantDiff)
+		case r.Method == "GET" && r.URL.Path == "/.ttrs/challenge":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"salt":"dddd4444dddd4444dddd4444dddd4444_44444444_16","difficulty":%d}`, wantDiff)
+		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+			postCount++
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"success":false,"reason":"invalid_solution","action":"retry"}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("expected an error when every retry is also rejected, got nil")
+	}
+	if postCount != tartarusMaxSolveAttempts {
+		t.Errorf("challenge POST count = %d, want %d (bounded, not infinite)", postCount, tartarusMaxSolveAttempts)
+	}
+	if !strings.Contains(err.Error(), "invalid_solution") {
+		t.Errorf("error %q does not contain the server's rejection reason", err.Error())
+	}
+}
+
 // newTestClient builds a TorClient backed by the test server's TLS client,
 // with a cookie jar and manual redirect handling matching production.
 func newTestClient(ts *httptest.Server) *TorClient {
