@@ -889,13 +889,96 @@ func TestSolveTartarusPOSTFailureIncludesDiagnostics(t *testing.T) {
 	}
 }
 
-func TestSolveTartarusRetriesOnServerSignaledRetry(t *testing.T) {
+func TestSolveTartarusRetriesSameSaltBeforeFetchingFresh(t *testing.T) {
 	// Reproduced live: a challenge salt handed to more than one concurrent
 	// requester is only redeemable by the first submission; the rest get
-	// {"success":false,"reason":"invalid_solution","action":"retry"}. That's
-	// a server-declared, bounded, self-resolving race -- fetching a fresh
-	// challenge draws a new salt -- so solveTartarus should retry
-	// automatically rather than failing on the first rejection.
+	// {"success":false,"reason":"invalid_solution","action":"retry"}. Also
+	// confirmed live: server-side rejection is scoped to the specific
+	// (salt, nonce) pair, not the salt as a whole -- an independently valid
+	// nonce for the SAME salt redeems fine. So the retry should continue
+	// brute-forcing the same salt for the next valid nonce first, which
+	// costs no extra network round trip, rather than fetching a fresh
+	// challenge on the very first rejection.
+	const (
+		salt     = "aaaa1111aaaa1111aaaa1111aaaa1111_11111111_16"
+		wantDiff = 16
+	)
+	p := TartarusParams{salt: salt, difficulty: wantDiff}
+	var firstNonce int
+	for n := 0; ; n++ {
+		if p.Check(n) {
+			firstNonce = n
+			break
+		}
+	}
+
+	var postCount, challengeEndpointGETs int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			if _, err := r.Cookie("ttrs_clearance"); err == nil {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "<html>real page</html>")
+				return
+			}
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprintf(w, `<html data-ttrs-challenge=%q data-ttrs-difficulty="%d"></html>`, salt, wantDiff)
+		case r.Method == "GET" && r.URL.Path == "/.ttrs/challenge":
+			challengeEndpointGETs++
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"salt":%q,"difficulty":%d}`, salt, wantDiff)
+		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+			postCount++
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			if form.Get("salt") != salt {
+				t.Errorf("POST salt = %q, want the same salt %q throughout", form.Get("salt"), salt)
+			}
+			nonce, _ := strconv.Atoi(form.Get("nonce"))
+			if nonce == firstNonce {
+				// Simulate losing the race on the first-found nonce.
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"success":false,"reason":"invalid_solution","action":"retry"}`)
+				return
+			}
+			// Any other independently-valid nonce for the same salt redeems.
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+	defer setMethod("GET")()
+
+	tc := newTestClient(ts)
+	resp, err := tc.Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if postCount != 2 {
+		t.Errorf("challenge POST count = %d, want 2 (one lost race, one same-salt retry that won)", postCount)
+	}
+	if challengeEndpointGETs != 0 {
+		t.Errorf("challenge endpoint GET count = %d, want 0 -- a same-salt retry shouldn't need a fresh challenge fetch", challengeEndpointGETs)
+	}
+	body, err := decodeBody(resp)
+	if err != nil {
+		t.Fatalf("decodeBody: %v", err)
+	}
+	if string(body) != "<html>real page</html>" {
+		t.Errorf("body = %q, want the real page", body)
+	}
+}
+
+func TestSolveTartarusFallsBackToFreshChallengeAfterSameSaltRetries(t *testing.T) {
+	// If a salt keeps getting rejected across tartarusMaxSameSaltRetries
+	// consecutive nonces, something other than an ordinary race may be
+	// going on (e.g. the salt itself expired), so the remaining attempts
+	// should escalate to fetching an entirely fresh challenge rather than
+	// exhausting the whole budget on one salt.
 	const (
 		staleSalt = "aaaa1111aaaa1111aaaa1111aaaa1111_11111111_16"
 		freshSalt = "bbbb2222bbbb2222bbbb2222bbbb2222_22222222_16"
@@ -914,7 +997,6 @@ func TestSolveTartarusRetriesOnServerSignaledRetry(t *testing.T) {
 			w.WriteHeader(http.StatusNonAuthoritativeInfo)
 			fmt.Fprintf(w, `<html data-ttrs-challenge=%q data-ttrs-difficulty="%d"></html>`, staleSalt, wantDiff)
 		case r.Method == "GET" && r.URL.Path == "/.ttrs/challenge":
-			// The retry path fetches a fresh salt from the JSON endpoint.
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"salt":%q,"difficulty":%d}`, freshSalt, wantDiff)
 		case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
@@ -922,12 +1004,11 @@ func TestSolveTartarusRetriesOnServerSignaledRetry(t *testing.T) {
 			body, _ := io.ReadAll(r.Body)
 			form, _ := url.ParseQuery(string(body))
 			if form.Get("salt") == staleSalt {
-				// Simulate losing the race on the first (stale) salt.
+				// staleSalt is permanently unredeemable, no matter the nonce.
 				w.WriteHeader(http.StatusBadRequest)
 				fmt.Fprint(w, `{"success":false,"reason":"invalid_solution","action":"retry"}`)
 				return
 			}
-			// The retried submission, on the fresh salt, succeeds.
 			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "test", Path: "/"})
 			fmt.Fprint(w, `{"success":true}`)
 		default:
@@ -944,8 +1025,10 @@ func TestSolveTartarusRetriesOnServerSignaledRetry(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if postCount != 2 {
-		t.Errorf("challenge POST count = %d, want 2 (one lost race, one retry that won)", postCount)
+	// tartarusMaxSameSaltRetries (2) rejections on staleSalt, plus the
+	// initial attempt, then one more on the fresh salt that succeeds.
+	if want := tartarusMaxSameSaltRetries + 2; postCount != want {
+		t.Errorf("challenge POST count = %d, want %d", postCount, want)
 	}
 	body, err := decodeBody(resp)
 	if err != nil {

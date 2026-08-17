@@ -907,28 +907,40 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 }
 
 // tartarusMaxSolveAttempts bounds the retry-on-server-signal loop in
-// solveTartarus. One salt is sometimes handed out to several concurrent
-// requests (observed live: identical salt/nonce computed independently by
-// parallel fetches), and only the first submission redeems it -- the rest
-// get rejected with an explicit action:"retry". That's a real, bounded,
-// self-resolving race (a fresh challenge fetch draws a new salt), not an
-// unknown failure mode, so it's safe to retry automatically -- but bounded,
-// so a challenge that's rejected for some other reason still fails loudly
-// rather than looping.
+// solveTartarus: a rejected submission can carry an explicit action:"retry",
+// and that's real, bounded, self-resolving signal rather than an unknown
+// failure mode, so it's safe to retry automatically -- but bounded, so a
+// challenge that's rejected for some other reason still fails loudly rather
+// than looping.
 const tartarusMaxSolveAttempts = 4
+
+// tartarusMaxSameSaltRetries bounds how many of those retries continue
+// brute-forcing the SAME salt for the next valid nonce, which is cheap (no
+// extra network round trip): server-side rejection was confirmed live to be
+// scoped to the specific (salt, nonce) pair, not the salt as a whole, so
+// resuming the same search past a rejected nonce is normally enough. If it
+// still isn't after a couple of tries, something else may be going on, so
+// the remaining attempts escalate to fetching an entirely fresh challenge
+// instead of exhausting the whole budget on a salt that might never redeem.
+const tartarusMaxSameSaltRetries = 2
 
 func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p TartarusParams, reqBody []byte) (*http.Response, error) {
 	referer := requestURL.String()
 	var lastErr error
+	nextNonce := 0 // resume point for the current salt's brute-force search
+	sameSaltRetries := 0
 	for attempt := 1; attempt <= tartarusMaxSolveAttempts; attempt++ {
-		// Brute-force SHA256 PoW from nonce=0.
+		// Brute-force SHA256 PoW, resuming past any nonce already rejected
+		// for this salt rather than restarting from 0 (which would just
+		// find that same rejected nonce again).
 		var nonce int
-		for n := 0; ; n++ {
+		for n := nextNonce; ; n++ {
 			if p.Check(n) {
 				nonce = n
 				break
 			}
 		}
+		nextNonce = nonce + 1
 
 		// POST the solution to /.ttrs/challenge as an XHR.
 		challengeURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
@@ -975,12 +987,19 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 		if err := json.Unmarshal(postBody, &reject); err != nil || reject.Action != "retry" || attempt == tartarusMaxSolveAttempts {
 			break
 		}
+
+		if sameSaltRetries < tartarusMaxSameSaltRetries {
+			sameSaltRetries++
+			continue
+		}
 		newP, err := tc.tartarusChallengeParams(requestURL, referer)
 		if err != nil {
 			lastErr = fmt.Errorf("%w (fetching a fresh challenge to retry also failed: %v)", lastErr, err)
 			break
 		}
 		p = newP
+		nextNonce = 0
+		sameSaltRetries = 0
 	}
 	return nil, lastErr
 }
