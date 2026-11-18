@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 go build              # Build ./tor-fetcher binary
 go test ./...         # Run all tests
 go test -v -run TestTartarusCheck  # Run a single test
-gofmt -w main.go      # Format before committing
+gofmt -w *.go         # Format before committing
 ```
 
 CI runs on CircleCI with `cimg/go:1.26` (large resource class): `go install ./...` then `go test ./...`.
@@ -19,7 +19,22 @@ tor-fetcher is a curl-like CLI for fetching .onion URLs protected by proof-of-wo
 
 ## Architecture
 
-All code lives in a single `main.go` (~1350 lines) with tests in `main_test.go`. This is intentional — keep it in one file.
+One `package main`, split by concern; each file's tests live in the matching `_test.go`. Keep new code in the file whose concern it belongs to, and split a file further once it grows past a few hundred lines rather than letting one file accumulate everything.
+
+| File | Concern |
+|---|---|
+| `main.go` | Flags, `main()`, `tracef` |
+| `client.go` | `TorClient`, `do`/`Get`/`PostForm`, the `Fetch` challenge loop |
+| `transport.go` | `utlsTransport` (h2/h1, Upgrade), `NewTorClient` (SOCKS dial + uTLS) |
+| `clienthello.go` | `torBrowserClientHello()` |
+| `headers.go` | Tor Browser request header sets |
+| `decode.go` | `decodeBody` (gzip/br/zstd/deflate) |
+| `tartarus.go` | Tartarus parsing, PoW, solve/submit/retry |
+| `bandwidth.go` | Tartarus bandwidth-stage WebSocket |
+| `basedflare.go` | BasedFlare Argon2 PoW |
+| `cookies.go` | `--cookie` / `--cookie-jar` persistence |
+
+Library code still reads some flag globals directly (`method`, `ua`, `parallelism`, `length`, `trace`).
 
 **Module path:** `github.com/endharassment/tor-fetcher`.
 
@@ -44,7 +59,7 @@ Challenge bodies must be read through `decodeBody`, never `io.ReadAll`: `setHead
 
 The tool impersonates Tor Browser, and the bar is **being served the same bytes as any other anonymous Tor user**, not merely not being blocked. So a header we send that Tor Browser doesn't is as much of a tell as one we're missing, and every value is captured rather than guessed.
 
-Two things are pinned to Tor Browser, both in `main.go` and asserted by `TestTorBrowserHeaders` / `TestTorBrowserClientHello`:
+Two things are pinned to Tor Browser, in `headers.go` and `clienthello.go`, asserted by `TestTorBrowserHeaders` / `TestTorBrowserClientHello`:
 
 - **Request headers** — `setHeaders` (top-level navigation), `setFormPostHeaders` (form submission), `setXHRHeaders` (the Tartarus challenge POST, an XHR whose script sets `Accept: application/json`), `webSocketHeaders` (bandwidth stage — **not yet captured**, Fetch-spec-derived). Notable: the document `Accept` carries no image types, `Accept-Language` is `q=0.5` (Firefox 153 says `q=0.9` — do not copy a newer Firefox), `Sec-GPC: 1` is sent, `DNT` is **not** (Tor Browser sets `privacy.donottrackheader.enabled=false`), and `Referer` is suppressed whenever the referring page is a `.onion` (`network.http.referer.hideOnionSource`).
 - **TLS ClientHello** — `torBrowserClientHello()`. utls's stock presets are unusable here: the newest is `HelloFirefox_120`, no Tor Browser was built on Firefox 120, and it offers `TLS_ECDHE_ECDSA_WITH_AES_{128,256}_CBC_SHA` which Tor Browser disables outright — advertising suites no Tor Browser advertises is a positive tell.
