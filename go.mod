@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/andybalholm/brotli v1.2.2
+	github.com/coder/websocket v1.8.15
 	github.com/klauspost/compress v1.19.2
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/crypto v0.54.0
