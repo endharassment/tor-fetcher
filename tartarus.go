@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 type TartarusParams struct {
 	salt       string
 	difficulty uint
+	steps      int // advertised step count; informational only (see checkTartarusCapability)
 }
 
 func (p TartarusParams) Check(n int) bool {
@@ -47,22 +49,47 @@ func extractAttr(s, attr string) string {
 const tartarusChallengePath = "/.ttrs/challenge"
 
 // checkTartarusCapability reports whether TartarusParams.Check can evaluate a
-// challenge advertising the given algorithm/steps. Check implements exactly
-// single-step SHA256 over salt+nonce, so anything else must be rejected
-// explicitly: silently treating an unsupported algorithm or step count as
-// sha256/steps=1 would submit a nonce that looks locally valid but is wrong
-// -- a worse failure than refusing outright, since it burns a solve attempt
-// (and a clearance-granting circuit) without any indication of why. Absent
-// attributes mean the defaults, which are supported.
+// challenge advertising the given algorithm/steps. Check implements SHA256
+// over salt+nonce, so any other algorithm must be rejected explicitly:
+// silently treating it as sha256 would submit a nonce that looks locally
+// valid but is wrong -- a worse failure than refusing outright, since it
+// burns a solve attempt without any indication of why. Absent attributes
+// mean the defaults, which are supported.
+//
+// The step count, by contrast, does not change what the client computes.
+// challenge.js (v=98eec8c2) receives it as ttrs_challenge's third argument
+// and never reads it, nothing reads data-ttrs-steps, and worker.js
+// (v=ee91eb68) has no notion of steps: a browser served steps=3 submits a
+// single SHA-256 nonce at the advertised difficulty, exactly as for steps=1.
+// So any well-formed step count is accepted; only a malformed one, which
+// would mean the challenge shape changed, is refused.
 func checkTartarusCapability(algorithm, steps string) error {
 	if algorithm != "" && algorithm != "sha256" {
 		return fmt.Errorf("unsupported tartarus algorithm %q (only sha256 is implemented)", algorithm)
 	}
-	if steps != "" && steps != "1" {
-		return fmt.Errorf("unsupported tartarus step count %q (only steps=1 is implemented)", steps)
+	if steps != "" {
+		if n, err := strconv.Atoi(steps); err != nil || n < 1 {
+			return fmt.Errorf("malformed tartarus step count %q", steps)
+		}
 	}
 	return nil
 }
+
+// stepCount converts a step count already validated by
+// checkTartarusCapability, defaulting to 1 when absent.
+func stepCount(s string) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return 1
+}
+
+// tartarusStartNonce returns where the nonce search begins. challenge.js
+// starts at Math.floor(Math.random() * Number.MAX_SAFE_INTEGER) and counts up;
+// starting at 0 would make every nonce we submit a small integer, where a
+// browser's is ~2^52 -- trivially distinguishable in server logs. A variable
+// so tests can pin it.
+var tartarusStartNonce = func() int { return rand.IntN(maxSafeInteger) }
 
 // parseTartarusChallenge extracts the PoW salt and difficulty from a Tartarus
 // challenge document. Two shapes are accepted: the HTML interstitial, which
@@ -78,10 +105,11 @@ func parseTartarusChallenge(body string) (TartarusParams, error) {
 		if err != nil || difficulty <= 0 {
 			return TartarusParams{}, fmt.Errorf("data-ttrs-challenge present but data-ttrs-difficulty is missing or invalid (%q)", difficultyStr)
 		}
-		if err := checkTartarusCapability(extractAttr(body, "data-ttrs-algorithm"), extractAttr(body, "data-ttrs-steps")); err != nil {
+		steps := extractAttr(body, "data-ttrs-steps")
+		if err := checkTartarusCapability(extractAttr(body, "data-ttrs-algorithm"), steps); err != nil {
 			return TartarusParams{}, err
 		}
-		return TartarusParams{salt: salt, difficulty: uint(difficulty)}, nil
+		return TartarusParams{salt: salt, difficulty: uint(difficulty), steps: stepCount(steps)}, nil
 	}
 
 	var j struct {
@@ -118,7 +146,7 @@ func parseTartarusChallenge(body string) (TartarusParams, error) {
 	if err := checkTartarusCapability(j.Algorithm, steps); err != nil {
 		return TartarusParams{}, err
 	}
-	return TartarusParams{salt: salt, difficulty: uint(difficulty)}, nil
+	return TartarusParams{salt: salt, difficulty: uint(difficulty), steps: stepCount(steps)}, nil
 }
 
 // tartarusChallengeParams asks tartarusChallengePath for the PoW parameters
@@ -192,11 +220,11 @@ const tartarusMaxSameSaltRetries = 2
 func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p TartarusParams, reqBody []byte) (*http.Response, error) {
 	referer := requestURL.String()
 	var lastErr error
-	nextNonce := 0 // resume point for the current salt's brute-force search
+	nextNonce := tartarusStartNonce() // resume point for the current salt's search
 	sameSaltRetries := 0
 	for attempt := 1; attempt <= tartarusMaxSolveAttempts; attempt++ {
 		// Brute-force SHA256 PoW, resuming past any nonce already rejected
-		// for this salt rather than restarting from 0 (which would just
+		// for this salt rather than restarting the search (which would just
 		// find that same rejected nonce again).
 		var nonce int
 		for n := nextNonce; ; n++ {
@@ -293,12 +321,12 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 		// The "fresh" challenge can come back with the SAME salt (observed
 		// live: the challenge endpoint's salt is itself coarsely time-
 		// bucketed, and a whole retry sequence can complete inside one
-		// bucket). Resetting the nonce search to 0 in that case would just
+		// bucket). Restarting the nonce search in that case could just
 		// resubmit the exact nonce that already lost -- only restart the
 		// search when the salt actually changed; otherwise keep advancing
 		// through the same search we were already running.
 		if newP.salt != p.salt {
-			nextNonce = 0
+			nextNonce = tartarusStartNonce()
 			sameSaltRetries = 0
 		}
 		p = newP

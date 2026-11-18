@@ -151,7 +151,7 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 		p, parseErr := parseTartarusChallenge(body)
 		switch {
 		case parseErr == nil:
-			tracef("  -> Tartarus challenge")
+			tracef("  -> Tartarus challenge (difficulty=%d steps=%d)", p.difficulty, p.steps)
 		case strings.Contains(body, "data-pow="):
 			tracef("  -> BasedFlare challenge")
 			bfResp, err := tc.solveBasedFlare(requestURL, body)
@@ -166,7 +166,7 @@ func (tc *TorClient) Fetch(target, referer string, reqBody []byte) (*http.Respon
 				return nil, fmt.Errorf("unrecognized %d challenge at %s: no BasedFlare parameters in the body; interstitial body unusable (%v); challenge endpoint also failed: %w; full interstitial body: %q",
 					resp.StatusCode, fetchURL, parseErr, chErr, body)
 			}
-			tracef("  -> Tartarus challenge (params from %s)", tartarusChallengePath)
+			tracef("  -> Tartarus challenge (difficulty=%d steps=%d, params from %s)", p.difficulty, p.steps, tartarusChallengePath)
 		}
 
 		challengeResp, err := tc.solveTartarus(method, requestURL, p, reqBody)

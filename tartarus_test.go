@@ -86,10 +86,16 @@ func TestParseTartarusChallenge(t *testing.T) {
 		// Unsupported PoW rules must read as unparsed rather than yield a nonce
 		// computed the wrong way, which the server would reject.
 		{"unsupported algorithm", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-algorithm="blake3">`, false, "", 0},
-		{"multi-step challenge", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="3">`, false, "", 0},
+		// The step count doesn't change what a browser computes (challenge.js
+		// ignores it), so any well-formed count parses; a malformed one means
+		// the challenge shape changed and must not.
+		{"multi-step challenge", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="3">`, true, "abc", 16},
+		{"malformed step count", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="banana">`, false, "", 0},
+		{"zero step count", `<html data-ttrs-challenge="abc" data-ttrs-difficulty="16" data-ttrs-steps="0">`, false, "", 0},
 		{"json unsupported algorithm", `{"salt":"abc","difficulty":16,"algorithm":"argon2id"}`, false, "", 0},
-		{"json multi-step challenge", `{"salt":"abc","difficulty":16,"steps":5}`, false, "", 0},
-		{"json multi-step challenge, string steps", `{"salt":"abc","difficulty":16,"steps":"5"}`, false, "", 0},
+		{"json multi-step challenge", `{"salt":"abc","difficulty":16,"steps":5}`, true, "abc", 16},
+		{"json multi-step challenge, string steps", `{"salt":"abc","difficulty":16,"steps":"5"}`, true, "abc", 16},
+		{"json malformed steps", `{"salt":"abc","difficulty":16,"steps":"x"}`, false, "", 0},
 		{"json steps=1 is fine", `{"salt":"abc","difficulty":16,"steps":1,"algorithm":"sha256"}`, true, "abc", 16},
 	}
 	for _, tt := range tests {
@@ -156,52 +162,135 @@ func TestFetchTartarusParamsFromChallengeEndpoint(t *testing.T) {
 	}
 }
 
-func TestFetchMultiStepChallengeFailsLoudlyWithDiagnostics(t *testing.T) {
-	// A live site briefly served data-ttrs-steps="5", which
-	// TartarusParams.Check cannot evaluate (it only implements single-step
-	// SHA256). A 200-char-truncated error destroyed the only captured
-	// evidence of what happened in production; this locks in that the full
-	// body and the specific rejection reason both survive into the returned
-	// error, and that no nonce is ever submitted for a challenge shape we
-	// can't correctly solve.
-	const (
-		wantSalt = "3238d142bb6fe535be51b1b19a95a69d_6a822332_21"
-		wantDiff = "21"
-	)
-	challengeHTML := fmt.Sprintf(
-		`<html id="ttrs" class="no-js no-scripts" data-ttrs-challenge=%q data-ttrs-difficulty=%q data-ttrs-steps="5" data-ttrs-algorithm="sha256" data-ttrs-worker-v="ee91eb68">`,
-		wantSalt, wantDiff)
+// pinStartNonce makes the nonce search start at n for the rest of the test,
+// so tests can predict which nonces the solver submits.
+func pinStartNonce(t *testing.T, n int) {
+	t.Helper()
+	old := tartarusStartNonce
+	tartarusStartNonce = func() int { return n }
+	t.Cleanup(func() { tartarusStartNonce = old })
+}
 
-	var sawPost bool
+func TestFetchStepCountHandling(t *testing.T) {
+	// Tartarus can advertise data-ttrs-steps > 1. The current challenge.js
+	// ignores the step count and submits one SHA-256
+	// nonce at the advertised difficulty, so we must solve it the same way.
+	// A malformed count still means an unknown shape: no nonce may be
+	// submitted, and the full body must survive into the error (a truncated
+	// error once destroyed the only production evidence).
+	const salt = "eeee5555eeee5555eeee5555eeee5555_55555555_16"
+	tests := []struct {
+		name      string
+		steps     string
+		wantPosts int
+		wantErr   []string // nil: success
+	}{
+		{name: "single step", steps: "1", wantPosts: 1},
+		{name: "multi-step solved as one nonce", steps: "3", wantPosts: 1},
+		{name: "five steps", steps: "5", wantPosts: 1},
+		{name: "malformed step count", steps: "banana", wantPosts: 0, wantErr: []string{salt, `"banana"`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			challengeHTML := fmt.Sprintf(
+				`<html id="ttrs" class="no-js no-scripts" data-ttrs-challenge=%q data-ttrs-difficulty="16" data-ttrs-steps=%q data-ttrs-algorithm="sha256" data-ttrs-worker-v="ee91eb68">`,
+				salt, tt.steps)
+			var posts []url.Values
+			ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == "POST" && r.URL.Path == "/.ttrs/challenge":
+					body, _ := io.ReadAll(r.Body)
+					v, _ := url.ParseQuery(string(body))
+					posts = append(posts, v)
+					http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "ok", Path: "/"})
+					fmt.Fprint(w, `{"success":true}`)
+				case r.URL.Path == "/.ttrs/challenge":
+					w.WriteHeader(http.StatusNotFound)
+				case r.Header.Get("Cookie") != "":
+					fmt.Fprint(w, "<html>real page</html>")
+				default:
+					w.WriteHeader(http.StatusNonAuthoritativeInfo)
+					fmt.Fprint(w, challengeHTML)
+				}
+			}))
+			defer ts.Close()
+			defer setMethod("GET")()
+
+			resp, err := newTestClient(ts).Fetch(ts.URL+"/", "", nil)
+			if len(posts) != tt.wantPosts {
+				t.Errorf("challenge POSTs = %d, want %d", len(posts), tt.wantPosts)
+			}
+			if tt.wantErr != nil {
+				if err == nil {
+					resp.Body.Close()
+					t.Fatal("expected an error, got nil")
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			resp.Body.Close()
+			n, err := strconv.Atoi(posts[0].Get("nonce"))
+			if err != nil || !(TartarusParams{salt: salt, difficulty: 16}).Check(n) {
+				t.Errorf("submitted nonce %q is not a valid single SHA-256 solution at difficulty 16", posts[0].Get("nonce"))
+			}
+		})
+	}
+}
+
+func TestTartarusNonceStartsLikeABrowser(t *testing.T) {
+	// challenge.js starts at floor(random * MAX_SAFE_INTEGER); a search from
+	// 0 would submit conspicuously small nonces.
+	var large int
+	for range 100 {
+		n := tartarusStartNonce()
+		if n < 0 || n >= maxSafeInteger {
+			t.Fatalf("start nonce %d outside [0, MAX_SAFE_INTEGER)", n)
+		}
+		if n > 1<<40 {
+			large++
+		}
+	}
+	if large < 90 {
+		t.Errorf("only %d/100 start nonces exceed 2^40; expected a uniform draw over [0, 2^53)", large)
+	}
+
+	// The solver searches upward from that start.
+	start := 1<<52 + 12345
+	pinStartNonce(t, start)
+	const salt = "a92a106fa4e8c2398ebcabecefebf28c_69853ed8"
+	var got string
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			sawPost = true
+		switch {
+		case r.Method == "POST":
+			body, _ := io.ReadAll(r.Body)
+			v, _ := url.ParseQuery(string(body))
+			got = v.Get("nonce")
+			http.SetCookie(w, &http.Cookie{Name: "ttrs_clearance", Value: "ok", Path: "/"})
+			fmt.Fprint(w, `{"success":true}`)
+		case r.Header.Get("Cookie") != "":
+			fmt.Fprint(w, "<html>real page</html>")
+		default:
+			w.WriteHeader(http.StatusNonAuthoritativeInfo)
+			fmt.Fprintf(w, `<html data-ttrs-challenge=%q data-ttrs-difficulty="16"></html>`, salt)
 		}
-		if r.URL.Path == "/.ttrs/challenge" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusNonAuthoritativeInfo)
-		fmt.Fprint(w, challengeHTML)
 	}))
 	defer ts.Close()
 	defer setMethod("GET")()
-
-	tc := newTestClient(ts)
-	resp, err := tc.Fetch(ts.URL+"/", "", nil)
-	if err == nil {
-		resp.Body.Close()
-		t.Fatal("expected an error on a steps=5 challenge, got nil")
+	resp, err := newTestClient(ts).Fetch(ts.URL+"/", "", nil)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
 	}
-	if sawPost {
-		t.Error("a solution was POSTed for a challenge whose PoW rules we can't evaluate")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, wantSalt) {
-		t.Errorf("error %q does not contain the challenge salt %q -- the diagnosable body was lost", msg, wantSalt)
-	}
-	if !strings.Contains(msg, `"5"`) {
-		t.Errorf("error %q does not mention the unsupported step count", msg)
+	resp.Body.Close()
+	n, err := strconv.Atoi(got)
+	if err != nil || n < start || !(TartarusParams{salt: salt, difficulty: 16}).Check(n) {
+		t.Errorf("submitted nonce %q, want a valid solution >= %d", got, start)
 	}
 }
 
@@ -334,6 +423,8 @@ func TestSolveTartarusPOSTFailureIncludesDiagnostics(t *testing.T) {
 }
 
 func TestSolveTartarusRetriesSameSaltBeforeFetchingFresh(t *testing.T) {
+	// These tests enumerate valid nonces from 0 to predict submissions.
+	pinStartNonce(t, 0)
 	// Reproduced live: a challenge salt handed to more than one concurrent
 	// requester is only redeemable by the first submission; the rest get
 	// {"success":false,"reason":"invalid_solution","action":"retry"}. Also
@@ -484,6 +575,8 @@ func TestSolveTartarusFallsBackToFreshChallengeAfterSameSaltRetries(t *testing.T
 }
 
 func TestSolveTartarusKeepsAdvancingWhenFreshChallengeMatchesSameSalt(t *testing.T) {
+	// These tests enumerate valid nonces from 0 to predict submissions.
+	pinStartNonce(t, 0)
 	// Observed live in production: the fallback "fresh challenge" fetch can
 	// come back with the SAME salt as before (the challenge endpoint's salt
 	// is itself coarsely time-bucketed, and a whole retry sequence can
