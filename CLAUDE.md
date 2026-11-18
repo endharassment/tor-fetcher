@@ -19,7 +19,7 @@ tor-fetcher is a curl-like CLI for fetching .onion URLs protected by proof-of-wo
 
 ## Architecture
 
-All code lives in a single `main.go` (~810 lines) with tests in `main_test.go`. This is intentional — keep it in one file.
+All code lives in a single `main.go` (~1350 lines) with tests in `main_test.go`. This is intentional — keep it in one file.
 
 **Module path:** `github.com/endharassment/tor-fetcher`.
 
@@ -34,6 +34,10 @@ All code lives in a single `main.go` (~810 lines) with tests in `main_test.go`. 
 
 `Fetch()` detects challenges via HTTP 203/403 status codes (plus the API-style 401 + `Www-Authenticate: Tartarus`). Each challenge type is matched **positively**: Tartarus via `parseTartarusChallenge` (`data-ttrs-*` attributes, or the JSON served by `/.ttrs/challenge`), BasedFlare via `data-pow=`. Neither is the fallback — an unrecognized body errors out, because a solver handed no parameters would otherwise submit a bogus zero-difficulty solution. When an interstitial carries no inline parameters, `tartarusChallengeParams` GETs `/.ttrs/challenge` for them. Solvers brute-force nonces, POST the solution, and the resulting clearance cookie allows the re-GET to succeed.
 
+Tartarus can chain a **bandwidth stage** after the PoW: the POST answers 200 with `{"next":"bandwidth","token":…,"bandwidth_size":…}` and no cookie. `solveTartarusBandwidth` then opens a WebSocket to `/.ttrs/captcha/bandwidth?token=…&proof=sha256`, SHA-256s each binary **message** (boundaries matter), and on `{"status":"verify"}` sends `{"proof": hex(sha256(concat(digests)))}`; `{"status":"ok"}` yields a receipt, re-POSTed with the same salt/nonce as `bandwidth_receipt`. Only `{"success":true}` is clearance — any other 200 errors out rather than re-GETting into the interstitial. Observed 2026-11-18: 20 MiB, ~45 s over Tor; the resulting `ttrs_clearance` works across circuits for ~7 days. `utlsTransport` supports the HTTP/1.1 Upgrade this needs (101 → raw conn as body); WebSocket over h2 is refused.
+
+The protocol was read from the site's `/.ttrs/static/challenge.js` (javascript-obfuscator) and `challenge-bandwidth.js`. **Never execute those scripts** to read them — not even in Node's `vm`, which is not a security boundary. Decode the string array statically (literal array + index offset + `parseInt` rotation checksum).
+
 Challenge bodies must be read through `decodeBody`, never `io.ReadAll`: `setHeaders` sets `Accept-Encoding` explicitly (for the Firefox fingerprint), which turns OFF Go's automatic decompression, so a gzipped interstitial otherwise arrives as binary that matches no challenge marker.
 
 ### Matching Tor Browser
@@ -42,7 +46,7 @@ The tool impersonates Tor Browser, and the bar is **being served the same bytes 
 
 Two things are pinned to Tor Browser, both in `main.go` and asserted by `TestTorBrowserHeaders` / `TestTorBrowserClientHello`:
 
-- **Request headers** — `setHeaders` (top-level navigation), `setFormPostHeaders` (form submission), `setXHRHeaders` (the Tartarus challenge POST, which in a browser is a `fetch()`). Notable: the document `Accept` carries no image types, `Accept-Language` is `q=0.5` (Firefox 153 says `q=0.9` — do not copy a newer Firefox), `Sec-GPC: 1` is sent, `DNT` is **not** (Tor Browser sets `privacy.donottrackheader.enabled=false`), and `Referer` is suppressed whenever the referring page is a `.onion` (`network.http.referer.hideOnionSource`).
+- **Request headers** — `setHeaders` (top-level navigation), `setFormPostHeaders` (form submission), `setXHRHeaders` (the Tartarus challenge POST, an XHR whose script sets `Accept: application/json`), `webSocketHeaders` (bandwidth stage — **not yet captured**, Fetch-spec-derived). Notable: the document `Accept` carries no image types, `Accept-Language` is `q=0.5` (Firefox 153 says `q=0.9` — do not copy a newer Firefox), `Sec-GPC: 1` is sent, `DNT` is **not** (Tor Browser sets `privacy.donottrackheader.enabled=false`), and `Referer` is suppressed whenever the referring page is a `.onion` (`network.http.referer.hideOnionSource`).
 - **TLS ClientHello** — `torBrowserClientHello()`. utls's stock presets are unusable here: the newest is `HelloFirefox_120`, no Tor Browser was built on Firefox 120, and it offers `TLS_ECDHE_ECDSA_WITH_AES_{128,256}_CBC_SHA` which Tor Browser disables outright — advertising suites no Tor Browser advertises is a positive tell.
 
 **Re-capturing when Tor Browser updates** (the version is in `about:support`; TB 15.0.19 ships Firefox 140.13.0esr):
@@ -59,6 +63,7 @@ Two things are pinned to Tor Browser, both in `main.go` and asserted by `TestTor
 | `refraction-networking/utls` | Firefox TLS fingerprinting |
 | `golang.org/x/crypto` | Argon2id hashing |
 | `golang.org/x/net` | HTTP/2 + SOCKS5 proxy dialing |
+| `coder/websocket` | Tartarus bandwidth-stage WebSocket |
 
 ### CLI Flags
 

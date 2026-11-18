@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -23,8 +24,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/coder/websocket"
 	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 	"github.com/refraction-networking/utls/dicttls"
@@ -588,12 +591,14 @@ func setFormPostHeaders(req *http.Request, page *url.URL, referer string) {
 	setReferer(req, referer)
 }
 
-// setXHRHeaders applies the headers a fetch() from page JavaScript sends --
-// what Tartarus's challenge POST actually is. A browser sends Accept: */* here,
-// not application/json, and carries an Origin.
+// setXHRHeaders applies the headers an XMLHttpRequest from page JavaScript
+// sends -- what Tartarus's challenge POST actually is. The default for an XHR
+// would be Accept: */*, but challenge.js (v=98eec8c2) explicitly calls
+// setRequestHeader('Accept','application/json'), so that is what Tor Browser
+// sends. It carries an Origin.
 func setXHRHeaders(req *http.Request, page *url.URL) {
 	setCommonHeaders(req)
-	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", formContentType)
 	req.Header.Set("Origin", page.Scheme+"://"+page.Host)
 	req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -601,6 +606,28 @@ func setXHRHeaders(req *http.Request, page *url.URL) {
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("Priority", "u=4")
 	setReferer(req, page.String())
+}
+
+// webSocketHeaders returns the headers for a same-origin `new WebSocket()`
+// handshake. The WebSocket library sets Connection/Upgrade/Sec-WebSocket-*
+// itself (it offers a bare permessage-deflate, as Firefox does).
+//
+// NOT YET CAPTURED from Tor Browser, unlike setHeaders/setXHRHeaders: these
+// follow the Fetch spec and Firefox's known WebSocket handshake (mode
+// "websocket", no-cache pragma). Re-capture per CLAUDE.md before relying on
+// them to blend in. Known difference: Firefox sends
+// "Connection: keep-alive, Upgrade"; the library forces "Connection: Upgrade".
+func webSocketHeaders(page *url.URL) http.Header {
+	req := &http.Request{Header: http.Header{}}
+	setCommonHeaders(req)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Origin", page.Scheme+"://"+page.Host)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "websocket")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Cache-Control", "no-cache")
+	return req.Header
 }
 
 // do issues a request with the given method (GET, HEAD, POST, ...). reqBody
@@ -655,10 +682,17 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	hostPort := net.JoinHostPort(addr, port)
 
+	// An HTTP/1.1 Upgrade (the Tartarus bandwidth WebSocket) takes over its
+	// connection, so it never rides a cached h2 conn and always dials fresh.
+	upgrade := req.Header.Get("Upgrade") != ""
+
 	// Try reusing a cached HTTP/2 connection.
-	t.mu.Lock()
-	cc := t.h2Conns[hostPort]
-	t.mu.Unlock()
+	var cc *http2.ClientConn
+	if !upgrade {
+		t.mu.Lock()
+		cc = t.h2Conns[hostPort]
+		t.mu.Unlock()
+	}
 	if cc != nil {
 		slog.Debug("transport: reusing h2 conn", "method", req.Method, "url", req.URL)
 		resp, err := cc.RoundTrip(req)
@@ -684,6 +718,14 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		alpn = uconn.ConnectionState().NegotiatedProtocol
 	}
 
+	if alpn == "h2" && upgrade {
+		// WebSockets over HTTP/2 need RFC 8441 extended CONNECT, which this
+		// transport doesn't speak. The Tartarus onion negotiates http/1.1
+		// today; fail loudly if that changes rather than send a bogus request.
+		conn.Close()
+		return nil, fmt.Errorf("server negotiated h2 for %s %s; WebSocket over HTTP/2 is not implemented", req.Method, req.URL)
+	}
+
 	if alpn == "h2" {
 		cc, err := (&http2.Transport{}).NewClientConn(conn)
 		if err != nil {
@@ -704,13 +746,29 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		conn.Close()
 		return nil, err
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		// Hand the connection itself back as the body, as net/http's
+		// Transport does: WebSocket clients require an io.ReadWriteCloser.
+		// Reads go through br, which may already hold the first frames.
+		resp.Body = &upgradedConn{Reader: br, Conn: conn}
+	}
 	return resp, nil
 }
+
+// upgradedConn is the body of a 101 Switching Protocols response: the raw
+// connection, read through the buffer that parsed the response headers.
+type upgradedConn struct {
+	*bufio.Reader
+	net.Conn
+}
+
+func (u *upgradedConn) Read(p []byte) (int, error) { return u.Reader.Read(p) }
 
 func NewTorClient() *TorClient {
 	proxyURL, err := url.Parse(*socksAddr)
@@ -942,40 +1000,68 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 		}
 		nextNonce = nonce + 1
 
-		// POST the solution to /.ttrs/challenge as an XHR.
 		challengeURL := fmt.Sprintf("%s://%s%s", requestURL.Scheme, requestURL.Host, tartarusChallengePath)
-		values := url.Values{}
-		values.Set("salt", p.salt)
-		values.Set("nonce", strconv.Itoa(nonce))
 		slog.Debug("tartarus challenge solved", "salt", p.salt, "difficulty", p.difficulty, "nonce", nonce, "attempt", attempt)
-		req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
-		if err != nil {
-			return nil, fmt.Errorf("building tartarus POST: %w", err)
-		}
-		// In a browser this POST is a fetch() issued by the interstitial's
-		// script, so it carries the XHR header set, not a page navigation's.
-		setXHRHeaders(req, requestURL)
-		postResp, err := tc.c.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("posting tartarus solution: %w", err)
-		}
-		postBody, _ := io.ReadAll(postResp.Body)
-		postResp.Body.Close()
-		slog.Debug("tartarus POST response", "status", postResp.StatusCode, "body", string(postBody))
-		slog.Debug("tartarus POST cookies", "set-cookie", postResp.Header["Set-Cookie"])
 
-		if postResp.StatusCode == http.StatusOK {
-			if tc.c.Jar != nil {
-				slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
+		// POST the solution. A 200 is not necessarily clearance: the server
+		// can answer the PoW with a bandwidth offer ({"next":"bandwidth",...},
+		// no Set-Cookie), in which case the same salt/nonce is re-POSTed with
+		// the receipt the bandwidth stage earned. Mirrors challenge.js
+		// (v=98eec8c2): success:true is clearance, a bandwidth offer is only
+		// honoured on the first POST, and any other 200 is a rejection.
+		receipt := ""
+		var postResp *http.Response
+		var postBody []byte
+		for {
+			var err error
+			postResp, postBody, err = tc.postTartarusSolution(challengeURL, requestURL, p.salt, nonce, receipt)
+			if err != nil {
+				return nil, err
 			}
-			// Re-fetch the original target with the CALLER'S method and body
-			// now that the ttrs_clearance cookie is set (the jar preserves
-			// it). Using the caller's method rather than a hardcoded GET
-			// means a HEAD probe never downloads the destination body --
-			// essential when the caller must learn a resource's status
-			// without fetching the resource itself. For GET this is
-			// unchanged.
-			return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
+			if postResp.StatusCode != http.StatusOK {
+				break
+			}
+			var accepted struct {
+				Success              bool   `json:"success"`
+				Next                 string `json:"next"`
+				Token                string `json:"token"`
+				BandwidthSize        int64  `json:"bandwidth_size"`
+				BandwidthTimeoutSecs int64  `json:"bandwidth_timeout_secs"`
+			}
+			if err := json.Unmarshal(postBody, &accepted); err != nil {
+				return nil, fmt.Errorf("tartarus challenge POST to %s returned 200 with a non-JSON body (salt=%s nonce=%d): %q", challengeURL, p.salt, nonce, postBody)
+			}
+			if accepted.Success {
+				if tc.c.Jar != nil {
+					slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
+				}
+				// Re-fetch the original target with the CALLER'S method and
+				// body now that the ttrs_clearance cookie is set (the jar
+				// preserves it). Using the caller's method rather than a
+				// hardcoded GET means a HEAD probe never downloads the
+				// destination body -- essential when the caller must learn a
+				// resource's status without fetching the resource itself.
+				return tc.do(method, requestURL.String(), requestURL.String(), reqBody)
+			}
+			if accepted.Next == "bandwidth" && receipt == "" {
+				if accepted.Token == "" || accepted.BandwidthSize <= 0 || accepted.BandwidthSize > maxSafeInteger || accepted.BandwidthTimeoutSecs < 0 {
+					return nil, fmt.Errorf("tartarus returned an invalid bandwidth offer (salt=%s nonce=%d): %q", p.salt, nonce, postBody)
+				}
+				receipt, err = tc.solveTartarusBandwidth(requestURL, accepted.Token, accepted.BandwidthSize, time.Duration(accepted.BandwidthTimeoutSecs)*time.Second)
+				if err != nil {
+					return nil, fmt.Errorf("tartarus bandwidth stage (salt=%s nonce=%d, offer %q): %w", p.salt, nonce, postBody, err)
+				}
+				continue
+			}
+			if accepted.Next != "" {
+				// Leave room for future stages without silently re-GETting
+				// back into the interstitial, which would look like a
+				// rejected solve rather than an unimplemented stage.
+				return nil, fmt.Errorf("tartarus PoW accepted but server requires an unsupported follow-up stage %q (salt=%s difficulty=%d nonce=%d, receipt sent=%t): response body: %q",
+					accepted.Next, p.salt, p.difficulty, nonce, receipt != "", postBody)
+			}
+			return nil, fmt.Errorf("tartarus challenge POST to %s returned 200 without success (salt=%s difficulty=%d nonce=%d, receipt sent=%t): response body: %q",
+				challengeURL, p.salt, p.difficulty, nonce, receipt != "", postBody)
 		}
 
 		lastErr = fmt.Errorf("tartarus challenge POST to %s returned %d (submitted salt=%s difficulty=%d nonce=%d, attempt %d/%d): response body: %q",
@@ -1011,6 +1097,152 @@ func (tc *TorClient) solveTartarus(method string, requestURL *url.URL, p Tartaru
 		p = newP
 	}
 	return nil, lastErr
+}
+
+// postTartarusSolution POSTs a solved challenge to challengeURL as the
+// interstitial's XHR does, with the bandwidth receipt appended when non-empty.
+// The body is built by hand rather than with url.Values.Encode, which sorts
+// keys: challenge.js sends salt, nonce, then bandwidth_receipt, and a
+// reordered body is a needless tell.
+func (tc *TorClient) postTartarusSolution(challengeURL string, page *url.URL, salt string, nonce int, receipt string) (*http.Response, []byte, error) {
+	body := "salt=" + url.QueryEscape(salt) + "&nonce=" + strconv.Itoa(nonce)
+	if receipt != "" {
+		body += "&bandwidth_receipt=" + url.QueryEscape(receipt)
+	}
+	req, err := http.NewRequest("POST", challengeURL, strings.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("building tartarus POST: %w", err)
+	}
+	setXHRHeaders(req, page)
+	resp, err := tc.c.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("posting tartarus solution: %w", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	tracef("POST %s -> %d %s (receipt=%t)", challengeURL, resp.StatusCode, http.StatusText(resp.StatusCode), receipt != "")
+	slog.Debug("tartarus POST response", "status", resp.StatusCode, "body", string(respBody))
+	slog.Debug("tartarus POST cookies", "set-cookie", resp.Header["Set-Cookie"])
+	return resp, respBody, nil
+}
+
+// maxSafeInteger is JavaScript's Number.MAX_SAFE_INTEGER, the bound
+// challenge.js enforces on bandwidth_size.
+const maxSafeInteger = 1<<53 - 1
+
+// tartarusBandwidthPath is the WebSocket endpoint for the bandwidth stage.
+const tartarusBandwidthPath = "/.ttrs/captcha/bandwidth"
+
+// tartarusBandwidthDefaultTimeout is challenge.js's fallback when the offer
+// carries no bandwidth_timeout_secs.
+const tartarusBandwidthDefaultTimeout = 120 * time.Second
+
+// solveTartarusBandwidth runs the bandwidth stage Tartarus can chain after the
+// PoW, and returns the receipt to re-POST alongside the solution. Protocol, as
+// implemented by challenge-bandwidth.js (v=67a29b51):
+//
+//  1. Open wss://<host>/.ttrs/captcha/bandwidth?token=<offer token>&proof=sha256.
+//  2. The server streams ~size bytes as binary messages. The client hashes
+//     each MESSAGE separately with SHA-256 -- message boundaries are part of
+//     the proof, so this can't be a running hash over the byte stream.
+//  3. On a text {"status":"verify"}, send {"proof": hex(sha256(concatenated
+//     per-message digests))}. (Without &proof=sha256 the browser uses
+//     BLAKE2b-256 instead; we always claim WebCrypto.)
+//  4. {"status":"ok","token":R,"next":"challenge"} yields receipt R;
+//     {"status":"fail","message":...} is a rejection.
+func (tc *TorClient) solveTartarusBandwidth(page *url.URL, token string, size int64, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = tartarusBandwidthDefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	scheme := "wss"
+	if page.Scheme == "http" {
+		scheme = "ws"
+	}
+	wsURL := fmt.Sprintf("%s://%s%s?token=%s&proof=sha256", scheme, page.Host, tartarusBandwidthPath, url.QueryEscape(token))
+
+	// coder/websocket rejects a client with a Timeout set, and must not
+	// follow redirects on a handshake; otherwise reuse our transport (Tor
+	// Browser ClientHello, same SOCKS proxy) and cookie jar.
+	hc := tc.c
+	hc.Timeout = 0
+	start := time.Now()
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPClient:      &hc,
+		HTTPHeader:      webSocketHeaders(page),
+		CompressionMode: websocket.CompressionContextTakeover,
+	})
+	if err != nil {
+		return "", fmt.Errorf("dialing %s: %w", wsURL, err)
+	}
+	defer conn.CloseNow()
+	// The whole payload may arrive as one message; allow it plus slack.
+	conn.SetReadLimit(size + 1<<20)
+	tracef("WS %s connected after %s; expecting %d bytes", tartarusBandwidthPath, time.Since(start).Round(time.Millisecond), size)
+
+	var digests []byte
+	var received int64
+	var messages int
+	proofSent := false
+	nextReport := int64(4 << 20)
+	for {
+		typ, data, err := conn.Read(ctx)
+		if err != nil {
+			return "", fmt.Errorf("bandwidth stream after %d/%d bytes in %d messages (%s): %w",
+				received, size, messages, time.Since(start).Round(time.Millisecond), err)
+		}
+		if typ == websocket.MessageBinary {
+			d := sha256.Sum256(data)
+			digests = append(digests, d[:]...)
+			received += int64(len(data))
+			messages++
+			if received >= nextReport {
+				tracef("  bandwidth: %d/%d bytes after %s", received, size, time.Since(start).Round(time.Millisecond))
+				nextReport += 4 << 20
+			}
+			continue
+		}
+		var msg struct {
+			Status  string `json:"status"`
+			Token   string `json:"token"`
+			Next    string `json:"next"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			// challenge-bandwidth.js ignores unparseable text frames.
+			slog.Debug("bandwidth: ignoring non-JSON text message", "data", string(data))
+			continue
+		}
+		switch msg.Status {
+		case "verify":
+			if proofSent {
+				continue
+			}
+			proofSent = true
+			sum := sha256.Sum256(digests)
+			proof, _ := json.Marshal(struct {
+				Proof string `json:"proof"`
+			}{hex.EncodeToString(sum[:])})
+			tracef("  bandwidth: received %d bytes in %d messages after %s; sending proof",
+				received, messages, time.Since(start).Round(time.Millisecond))
+			if err := conn.Write(ctx, websocket.MessageText, proof); err != nil {
+				return "", fmt.Errorf("sending bandwidth proof: %w", err)
+			}
+		case "ok":
+			conn.Close(websocket.StatusNormalClosure, "")
+			if msg.Next != "challenge" || msg.Token == "" {
+				return "", fmt.Errorf("bandwidth stage did not return a receipt: %q", data)
+			}
+			tracef("  bandwidth: receipt after %s", time.Since(start).Round(time.Millisecond))
+			return msg.Token, nil
+		case "fail":
+			return "", fmt.Errorf("bandwidth stage failed after %d/%d bytes: %q", received, size, data)
+		default:
+			slog.Debug("bandwidth: ignoring text message", "data", string(data))
+		}
+	}
 }
 
 func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
